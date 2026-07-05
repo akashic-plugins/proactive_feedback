@@ -1,0 +1,10 @@
+{
+  "name": "proactive_feedback",
+  "version": "0.1.0",
+  "description": "Akashic proactive feedback plugin",
+  "akashic": {
+    "lifecycle": {
+      "entry": "plugin.py"
+    }
+  }
+}
