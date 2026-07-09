@@ -147,9 +147,7 @@ class ProactiveFeedbackPlugin(Plugin):
                 finally:
                     sink.close()
                 if event_id is not None:
-                    await self.context.event_bus.fanout(
-                        ProactiveFeedbackRecorded(event_id=event_id, feedback=feedback)
-                    )
+                    await self.context.event_bus.fanout(_recorded_event(event_id, feedback))
         if scored is None:
             return
 
@@ -173,13 +171,11 @@ class ProactiveFeedbackPlugin(Plugin):
         finally:
             sink.close()
         if event_id is not None:
-            await self.context.event_bus.fanout(
-                ProactiveFeedbackRecorded(event_id=event_id, feedback=feedback)
-            )
+            await self.context.event_bus.fanout(_recorded_event(event_id, feedback))
 
     def _get_embedder(self) -> Embedder:
         if self._embedder is None:
-            self._embedder = _build_embedder(self._project_root)
+            self._embedder = _build_embedder(self.context.plugin_dir)
         return self._embedder
 
     @tool(
@@ -229,6 +225,21 @@ def _build_embedder(root: Path) -> Embedder:
         api_key=embedding.api_key,
         model=embedding.model,
         output_dimensionality=embedding.output_dimensionality,
+    )
+
+
+def _recorded_event(event_id: int, feedback: FeedbackEvent) -> ProactiveFeedbackRecorded:
+    return ProactiveFeedbackRecorded(
+        event_id=event_id,
+        session_key=feedback.session_key,
+        user_message_id=feedback.user_message_id,
+        assistant_message_id=feedback.assistant_message_id,
+        proactive_message_id=feedback.proactive_message_id or "",
+        feedback_type=feedback.feedback_type,
+        confidence=feedback.confidence,
+        pua_score=feedback.pua_score,
+        lag_seconds=feedback.lag_seconds,
+        matched_by=feedback.matched_by,
     )
 
 
