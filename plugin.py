@@ -29,6 +29,7 @@ _QUEUE_MAX = 100
 
 class ProactiveFeedbackPlugin(Plugin):
     name = "proactive_feedback"
+    version = "1.0.0"
 
     async def initialize(self) -> None:
         workspace = self.context.workspace
