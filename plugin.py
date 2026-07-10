@@ -28,6 +28,10 @@ _QUEUE_MAX = 100
 
 
 class ProactiveFeedbackPlugin(Plugin):
+    @classmethod
+    def dashboard_module(cls) -> str | None:
+        return "dashboard.py"
+
     name = "proactive_feedback"
     version = "1.0.0"
 
@@ -41,7 +45,7 @@ class ProactiveFeedbackPlugin(Plugin):
         self._db_path = workspace / "proactive_feedback" / "proactive_feedback.db"
         self._queue: asyncio.Queue[TurnCommitted] = asyncio.Queue(maxsize=_QUEUE_MAX)
         self._embedder: Embedder | None = None
-        self._worker_task = asyncio.create_task(
+        self._worker_task = self.context.create_task(
             self._run_worker(),
             name="proactive_feedback_worker",
         )

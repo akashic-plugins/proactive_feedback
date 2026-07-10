@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent.plugins.context import PluginContext, PluginKVStore
+from agent.plugins.scope import PluginScope, ScopedEventBus
 from bus.event_bus import EventBus
 
 
@@ -33,20 +34,23 @@ FeedbackEvent = module.FeedbackEvent
 @pytest.mark.asyncio
 async def test_proactive_feedback_summary_empty(tmp_path: Path) -> None:
     plugin = ProactiveFeedbackPlugin()
+    scope = PluginScope("proactive_feedback")
     plugin.context = PluginContext(
-        event_bus=EventBus(),
+        event_bus=ScopedEventBus(EventBus(), scope),
         tool_registry=None,
         plugin_id="proactive_feedback",
         plugin_dir=tmp_path,
         data_dir=tmp_path,
         kv_store=PluginKVStore(tmp_path / ".kv.json"),
         workspace=tmp_path,
+        scope=scope,
     )
     await plugin.initialize()
     try:
         summary = await plugin.get_summary(None)
     finally:
         await plugin.terminate()
+        assert await scope.aclose() == []
     assert summary["total"] == 0
 
 
