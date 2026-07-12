@@ -96,7 +96,7 @@ function TextBlock(props: { title: string; text: string }): ReactElement {
   return (
     <div className="detail-block">
       <div className="detail-label">{props.title}</div>
-      <div className="detail-content whitespace-pre-wrap">{props.text || "-"}</div>
+      <div className="detail-content ak-plugin-pre-wrap">{props.text || "-"}</div>
     </div>
   );
 }
