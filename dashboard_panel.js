@@ -1,4 +1,4 @@
-// plugins/proactive_feedback/dashboard_panel.tsx
+// ../akashic-plugin/proactive_feedback/dashboard_panel.tsx
 import { Chip, api } from "@akashic/dashboard-ui";
 import { jsx, jsxs } from "react/jsx-runtime";
 function _score(value) {
@@ -77,7 +77,7 @@ function DetailRow(props) {
 function TextBlock(props) {
   return /* @__PURE__ */ jsxs("div", { className: "detail-block", children: [
     /* @__PURE__ */ jsx("div", { className: "detail-label", children: props.title }),
-    /* @__PURE__ */ jsx("div", { className: "detail-content whitespace-pre-wrap", children: props.text || "-" })
+    /* @__PURE__ */ jsx("div", { className: "detail-content ak-plugin-pre-wrap", children: props.text || "-" })
   ] });
 }
 window.AkashicDashboard.registerPlugin({
