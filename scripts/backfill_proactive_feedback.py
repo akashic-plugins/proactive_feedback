@@ -49,6 +49,18 @@ class BackfillStats:
     failed: int = 0
 
 
+def _resolve_workspace(explicit: Path | None) -> Path:
+    if explicit is not None:
+        raw_explicit = str(explicit).strip()
+        if not raw_explicit:
+            raise RuntimeError("--workspace 不能为空")
+        return Path(raw_explicit).expanduser()
+    workspace = os.environ.get("AKASHIC_WORKSPACE", "").strip()
+    if not workspace:
+        raise RuntimeError("未提供 --workspace，且缺少 AKASHIC_WORKSPACE")
+    return Path(workspace).expanduser()
+
+
 async def _no_embed(texts: list[str]) -> list[list[float]]:
     _ = texts
     raise RuntimeError("quoted feedback must not call embedding")
@@ -170,7 +182,7 @@ async def run_backfill(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill proactive feedback events from sessions.db")
-    _ = parser.add_argument("--workspace", type=Path, default=Path.home() / ".akashic" / "workspace")
+    _ = parser.add_argument("--workspace", type=Path)
     _ = parser.add_argument("--project-root", type=Path, default=AGENT_ROOT)
     _ = parser.add_argument("--clear", action="store_true", help="clear existing feedback events before writing")
     _ = parser.add_argument("--dry-run", action="store_true", help="score without writing")
@@ -180,7 +192,7 @@ def main() -> None:
 
     stats = asyncio.run(
         run_backfill(
-            workspace=args.workspace,
+            workspace=_resolve_workspace(args.workspace),
             project_root=args.project_root,
             clear=args.clear,
             limit=args.limit,
