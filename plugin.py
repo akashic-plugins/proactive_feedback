@@ -14,6 +14,7 @@ from bus.events_lifecycle import TurnCommitted
 from memory2.embedder import Embedder
 
 from .db import FeedbackEvent, insert_feedback, open_db
+from .dashboard import ProactiveFeedbackDashboardReader
 from .scorer import (
     latest_turn_messages,
     parse_quote_parts,
@@ -31,6 +32,14 @@ class ProactiveFeedbackPlugin(Plugin):
     @classmethod
     def dashboard_module(cls) -> str | None:
         return "dashboard.py"
+
+    @classmethod
+    def mobile_ui_module(cls) -> str | None:
+        return "mobile_panel.js"
+
+    @classmethod
+    def mobile_ui_stylesheet(cls) -> str | None:
+        return "mobile_panel.css"
 
     name = "proactive_feedback"
     version = "1.0.0"
@@ -58,6 +67,44 @@ class ProactiveFeedbackPlugin(Plugin):
         _ = task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
+    async def mobile_ui_call(
+        self,
+        method: str,
+        payload: dict[str, object],
+        *,
+        session_id: str | None,
+        turn_id: str | None,
+    ) -> dict[str, object]:
+        """返回主动反馈的移动端任务投影。"""
+
+        # 1. 在插件 RPC 边界校验查询方法与分页参数
+        _ = session_id, turn_id
+        if method not in {"feedback.overview", "feedback.events"}:
+            raise ValueError(f"未知 proactive_feedback 移动方法: {method}")
+        workspace = self.context.workspace
+        if workspace is None:
+            raise RuntimeError("proactive_feedback 移动看板缺少 workspace")
+        reader = ProactiveFeedbackDashboardReader(workspace)
+        if method == "feedback.overview":
+            return await asyncio.to_thread(reader.get_overview)
+
+        # 2. 列表查询复用桌面端已经验证的反馈关联数据
+        page = _mobile_page_value(payload, "page", default=1, maximum=10_000)
+        page_size = _mobile_page_value(payload, "page_size", default=30, maximum=50)
+        feedback_type = _mobile_feedback_type(payload)
+        items, total = await asyncio.to_thread(
+            reader.list_events,
+            page=page,
+            page_size=page_size,
+            feedback_type=feedback_type,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     def _on_turn_committed(self, event: TurnCommitted) -> None:
         if event.persisted_user_message is None:
@@ -180,7 +227,7 @@ class ProactiveFeedbackPlugin(Plugin):
 
     def _get_embedder(self) -> Embedder:
         if self._embedder is None:
-            self._embedder = _build_embedder(self.context.plugin_dir)
+            self._embedder = _build_embedder(self._workspace)
         return self._embedder
 
     @tool(
@@ -222,9 +269,8 @@ class ProactiveFeedbackPlugin(Plugin):
         return {"total": total, "by_type": by_type, "by_confidence": by_confidence}
 
 
-def _build_embedder(root: Path) -> Embedder:
-    _ = root
-    embedding = Config.load().memory.embedding
+def _build_embedder(workspace: Path) -> Embedder:
+    embedding = Config.load(workspace=workspace).memory.embedding
     return Embedder(
         base_url=embedding.base_url,
         api_key=embedding.api_key,
@@ -255,3 +301,26 @@ async def _no_embed(texts: list[str]) -> list[list[float]]:
 
 def _rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+def _mobile_page_value(
+    payload: dict[str, object],
+    name: str,
+    *,
+    default: int,
+    maximum: int,
+) -> int:
+    value = payload.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
+        raise ValueError(f"{name} 必须是 1 到 {maximum} 的整数")
+    return value
+
+
+def _mobile_feedback_type(payload: dict[str, object]) -> str:
+    value = payload.get("feedback_type", "")
+    if not isinstance(value, str):
+        raise ValueError("feedback_type 必须是字符串")
+    allowed = {"", "topic_follow", "explicit_quote", "no_topic_follow", "unscored"}
+    if value not in allowed:
+        raise ValueError("feedback_type 不受支持")
+    return value
