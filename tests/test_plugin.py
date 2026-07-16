@@ -26,6 +26,20 @@ def _load_plugin_module():
     return module
 
 
+def _plugin_context(tmp_path: Path) -> PluginContext:
+    scope = PluginScope("proactive_feedback")
+    return PluginContext(
+        event_bus=ScopedEventBus(EventBus(), scope),
+        tool_registry=None,
+        plugin_id="proactive_feedback",
+        plugin_dir=tmp_path,
+        data_dir=tmp_path,
+        kv_store=PluginKVStore(tmp_path / ".kv.json"),
+        workspace=tmp_path,
+        scope=scope,
+    )
+
+
 module = _load_plugin_module()
 ProactiveFeedbackPlugin = module.ProactiveFeedbackPlugin
 FeedbackEvent = module.FeedbackEvent
@@ -84,7 +98,7 @@ def test_recorded_event_matches_runtime_shape() -> None:
     assert event.matched_by == "recent_pua"
 
 
-def test_get_embedder_uses_plugin_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_get_embedder_uses_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     seen: list[Path] = []
 
     def fake_build_embedder(root: Path) -> object:
@@ -92,15 +106,8 @@ def test_get_embedder_uses_plugin_dir(monkeypatch: pytest.MonkeyPatch, tmp_path:
         return object()
 
     plugin = ProactiveFeedbackPlugin()
-    plugin.context = PluginContext(
-        event_bus=EventBus(),
-        tool_registry=None,
-        plugin_id="proactive_feedback",
-        plugin_dir=tmp_path,
-        data_dir=tmp_path,
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
-        workspace=tmp_path,
-    )
+    plugin.context = _plugin_context(tmp_path)
+    plugin._workspace = tmp_path
     plugin._embedder = None
     monkeypatch.setattr(module, "_build_embedder", fake_build_embedder)
 
@@ -108,3 +115,101 @@ def test_get_embedder_uses_plugin_dir(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
     assert embedder is plugin._embedder
     assert seen == [tmp_path]
+
+
+@pytest.mark.asyncio
+async def test_mobile_feedback_projection_reuses_dashboard_reader(tmp_path: Path) -> None:
+    plugin = ProactiveFeedbackPlugin()
+    plugin.context = _plugin_context(tmp_path)
+    sink = module.open_db(tmp_path / "proactive_feedback" / "proactive_feedback.db")
+    try:
+        module.insert_feedback(
+            sink,
+            FeedbackEvent(
+                session_key="mobile:test",
+                user_message_id="u-mobile",
+                assistant_message_id="a-mobile",
+                proactive_message_id="p-mobile",
+                feedback_type="explicit_quote",
+                confidence="gold",
+                pa_score=1.0,
+                pua_score=None,
+                lag_seconds=8,
+                candidate_count=1,
+                matched_by="quote",
+                reason="explicit_quote",
+            ),
+        )
+    finally:
+        sink.close()
+
+    overview = await plugin.mobile_ui_call(
+        "feedback.overview",
+        {},
+        session_id=None,
+        turn_id=None,
+    )
+    page = await plugin.mobile_ui_call(
+        "feedback.events",
+        {"page": 1, "page_size": 30, "feedback_type": "explicit_quote"},
+        session_id=None,
+        turn_id=None,
+    )
+
+    assert overview["total"] == 1
+    assert overview["follow_rate"] == 1.0
+    assert page["total"] == 1
+    assert page["items"][0]["feedback_type"] == "explicit_quote"
+
+
+@pytest.mark.asyncio
+async def test_mobile_feedback_projection_rejects_unknown_filter(tmp_path: Path) -> None:
+    plugin = ProactiveFeedbackPlugin()
+    plugin.context = _plugin_context(tmp_path)
+
+    with pytest.raises(ValueError, match="feedback_type 不受支持"):
+        await plugin.mobile_ui_call(
+            "feedback.events",
+            {"feedback_type": "invented"},
+            session_id=None,
+            turn_id=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"page": True}, "page 必须"),
+        ({"page_size": 51}, "page_size 必须"),
+    ],
+)
+async def test_mobile_feedback_projection_rejects_invalid_page(
+    tmp_path: Path,
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    plugin = ProactiveFeedbackPlugin()
+    plugin.context = _plugin_context(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        await plugin.mobile_ui_call(
+            "feedback.events",
+            payload,
+            session_id=None,
+            turn_id=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_mobile_feedback_projection_rejects_unknown_method(tmp_path: Path) -> None:
+    plugin = ProactiveFeedbackPlugin()
+    plugin.context = _plugin_context(tmp_path)
+
+    with pytest.raises(ValueError, match="未知 proactive_feedback 移动方法"):
+        await plugin.mobile_ui_call(
+            "feedback.delete",
+            {},
+            session_id=None,
+            turn_id=None,
+        )
