@@ -96,6 +96,8 @@ test("mobile navigation describes the proactive feedback task", () => {
   assert.equal(panel.default.navigation.label, "主动反馈");
   assert.match(panel.default.navigation.description, /是否被继续/);
   assert.equal(typeof panel.default.dashboard.mount, "function");
+  assert.doesNotMatch(source, /context\.request/);
+  assert.match(source, /context\.query\("feedback\.overview"\)/);
 });
 
 test("feedback types keep stable semantic labels and tones", () => {
@@ -152,7 +154,7 @@ test("dashboard clears a failed filter state after the next filter succeeds", as
   };
   const host = new DashboardHost();
   const context = {
-    request(method, payload = {}) {
+    query(method, payload = {}) {
       if (method === "feedback.overview") {
         return Promise.resolve({ follow_rate: 0.4, explicit_quote: 2, high_confidence: 3 });
       }

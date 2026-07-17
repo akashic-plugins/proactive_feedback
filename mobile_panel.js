@@ -135,7 +135,7 @@ const dashboard = {
     const loadEvents = (feedbackType) => {
       events.classList.remove("error");
       events.classList.add("is-loading");
-      return context.request("feedback.events", {
+      return context.query("feedback.events", {
         page: 1,
         page_size: 30,
         feedback_type: feedbackType,
@@ -158,7 +158,7 @@ const dashboard = {
     };
 
     Promise.all([
-      context.request("feedback.overview"),
+      context.query("feedback.overview"),
       loadEvents(""),
     ]).then(([overview]) => {
       if (!active) return;

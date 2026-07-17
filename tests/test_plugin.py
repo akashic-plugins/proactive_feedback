@@ -117,8 +117,16 @@ def test_get_embedder_uses_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert seen == [tmp_path]
 
 
-@pytest.mark.asyncio
-async def test_mobile_feedback_projection_reuses_dashboard_reader(tmp_path: Path) -> None:
+def test_mobile_contribution_declares_dashboard() -> None:
+    contribution = ProactiveFeedbackPlugin.mobile_ui()
+
+    assert contribution.module == "mobile_panel.js"
+    assert contribution.stylesheet == "mobile_panel.css"
+    assert contribution.navigation is not None
+    assert contribution.navigation.label == "主动反馈"
+
+
+def test_mobile_feedback_projection_reuses_dashboard_reader(tmp_path: Path) -> None:
     plugin = ProactiveFeedbackPlugin()
     plugin.context = _plugin_context(tmp_path)
     sink = module.open_db(tmp_path / "proactive_feedback" / "proactive_feedback.db")
@@ -143,13 +151,13 @@ async def test_mobile_feedback_projection_reuses_dashboard_reader(tmp_path: Path
     finally:
         sink.close()
 
-    overview = await plugin.mobile_ui_call(
+    overview = plugin.mobile_ui_query(
         "feedback.overview",
         {},
         session_id=None,
         turn_id=None,
     )
-    page = await plugin.mobile_ui_call(
+    page = plugin.mobile_ui_query(
         "feedback.events",
         {"page": 1, "page_size": 30, "feedback_type": "explicit_quote"},
         session_id=None,
@@ -162,13 +170,12 @@ async def test_mobile_feedback_projection_reuses_dashboard_reader(tmp_path: Path
     assert page["items"][0]["feedback_type"] == "explicit_quote"
 
 
-@pytest.mark.asyncio
-async def test_mobile_feedback_projection_rejects_unknown_filter(tmp_path: Path) -> None:
+def test_mobile_feedback_projection_rejects_unknown_filter(tmp_path: Path) -> None:
     plugin = ProactiveFeedbackPlugin()
     plugin.context = _plugin_context(tmp_path)
 
     with pytest.raises(ValueError, match="feedback_type 不受支持"):
-        await plugin.mobile_ui_call(
+        plugin.mobile_ui_query(
             "feedback.events",
             {"feedback_type": "invented"},
             session_id=None,
@@ -176,7 +183,6 @@ async def test_mobile_feedback_projection_rejects_unknown_filter(tmp_path: Path)
         )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
@@ -184,7 +190,7 @@ async def test_mobile_feedback_projection_rejects_unknown_filter(tmp_path: Path)
         ({"page_size": 51}, "page_size 必须"),
     ],
 )
-async def test_mobile_feedback_projection_rejects_invalid_page(
+def test_mobile_feedback_projection_rejects_invalid_page(
     tmp_path: Path,
     payload: dict[str, object],
     message: str,
@@ -193,7 +199,7 @@ async def test_mobile_feedback_projection_rejects_invalid_page(
     plugin.context = _plugin_context(tmp_path)
 
     with pytest.raises(ValueError, match=message):
-        await plugin.mobile_ui_call(
+        plugin.mobile_ui_query(
             "feedback.events",
             payload,
             session_id=None,
@@ -201,13 +207,12 @@ async def test_mobile_feedback_projection_rejects_invalid_page(
         )
 
 
-@pytest.mark.asyncio
-async def test_mobile_feedback_projection_rejects_unknown_method(tmp_path: Path) -> None:
+def test_mobile_feedback_projection_rejects_unknown_method(tmp_path: Path) -> None:
     plugin = ProactiveFeedbackPlugin()
     plugin.context = _plugin_context(tmp_path)
 
     with pytest.raises(ValueError, match="未知 proactive_feedback 移动方法"):
-        await plugin.mobile_ui_call(
+        plugin.mobile_ui_query(
             "feedback.delete",
             {},
             session_id=None,

@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from agent.config_models import Config
-from agent.plugins import Plugin, tool
+from agent.plugins import MobileUiContribution, MobileUiNavigation, Plugin, tool
+from agent.plugins.mobile_ui import MobileUiRpcInvalidRequest
 from bus.events_proactive import ProactiveFeedbackRecorded
 from bus.events_lifecycle import TurnCommitted
 from memory2.embedder import Embedder
@@ -34,15 +35,18 @@ class ProactiveFeedbackPlugin(Plugin):
         return "dashboard.py"
 
     @classmethod
-    def mobile_ui_module(cls) -> str | None:
-        return "mobile_panel.js"
-
-    @classmethod
-    def mobile_ui_stylesheet(cls) -> str | None:
-        return "mobile_panel.css"
+    def mobile_ui(cls) -> MobileUiContribution:
+        return MobileUiContribution(
+            module="mobile_panel.js",
+            stylesheet="mobile_panel.css",
+            navigation=MobileUiNavigation(
+                label="主动反馈",
+                description="主动消息是否被继续，以及对应的回应链路",
+            ),
+        )
 
     name = "proactive_feedback"
-    version = "1.0.0"
+    version = "1.1.0"
 
     async def initialize(self) -> None:
         workspace = self.context.workspace
@@ -68,7 +72,7 @@ class ProactiveFeedbackPlugin(Plugin):
         with suppress(asyncio.CancelledError):
             await task
 
-    async def mobile_ui_call(
+    def mobile_ui_query(
         self,
         method: str,
         payload: dict[str, object],
@@ -81,20 +85,25 @@ class ProactiveFeedbackPlugin(Plugin):
         # 1. 在插件 RPC 边界校验查询方法与分页参数
         _ = session_id, turn_id
         if method not in {"feedback.overview", "feedback.events"}:
-            raise ValueError(f"未知 proactive_feedback 移动方法: {method}")
+            raise MobileUiRpcInvalidRequest(
+                f"未知 proactive_feedback 移动方法: {method}"
+            )
         workspace = self.context.workspace
         if workspace is None:
             raise RuntimeError("proactive_feedback 移动看板缺少 workspace")
         reader = ProactiveFeedbackDashboardReader(workspace)
         if method == "feedback.overview":
-            return await asyncio.to_thread(reader.get_overview)
+            if payload:
+                raise MobileUiRpcInvalidRequest("feedback.overview 不接受参数")
+            return reader.get_overview()
 
-        # 2. 列表查询复用桌面端已经验证的反馈关联数据
+        # 2. 调度器线程复用桌面端已经验证的反馈关联数据
+        if set(payload) - {"page", "page_size", "feedback_type"}:
+            raise MobileUiRpcInvalidRequest("feedback.events 参数无效")
         page = _mobile_page_value(payload, "page", default=1, maximum=10_000)
         page_size = _mobile_page_value(payload, "page_size", default=30, maximum=50)
         feedback_type = _mobile_feedback_type(payload)
-        items, total = await asyncio.to_thread(
-            reader.list_events,
+        items, total = reader.list_events(
             page=page,
             page_size=page_size,
             feedback_type=feedback_type,
@@ -312,15 +321,15 @@ def _mobile_page_value(
 ) -> int:
     value = payload.get(name, default)
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
-        raise ValueError(f"{name} 必须是 1 到 {maximum} 的整数")
+        raise MobileUiRpcInvalidRequest(f"{name} 必须是 1 到 {maximum} 的整数")
     return value
 
 
 def _mobile_feedback_type(payload: dict[str, object]) -> str:
     value = payload.get("feedback_type", "")
     if not isinstance(value, str):
-        raise ValueError("feedback_type 必须是字符串")
+        raise MobileUiRpcInvalidRequest("feedback_type 必须是字符串")
     allowed = {"", "topic_follow", "explicit_quote", "no_topic_follow", "unscored"}
     if value not in allowed:
-        raise ValueError("feedback_type 不受支持")
+        raise MobileUiRpcInvalidRequest("feedback_type 不受支持")
     return value
