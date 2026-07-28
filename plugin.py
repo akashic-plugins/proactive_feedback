@@ -30,6 +30,7 @@ _QUEUE_MAX = 100
 
 
 class ProactiveFeedbackPlugin(Plugin):
+    api_version = 2
     @classmethod
     def dashboard_module(cls) -> str | None:
         return "dashboard.py"
@@ -48,7 +49,7 @@ class ProactiveFeedbackPlugin(Plugin):
     name = "proactive_feedback"
     version = "1.1.0"
 
-    async def initialize(self) -> None:
+    def activate(self) -> None:
         workspace = self.context.workspace
         if workspace is None:
             logger.warning("proactive_feedback 插件缺少 workspace，跳过加载")
