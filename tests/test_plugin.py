@@ -59,7 +59,7 @@ async def test_proactive_feedback_summary_empty(tmp_path: Path) -> None:
         workspace=tmp_path,
         scope=scope,
     )
-    await plugin.initialize()
+    plugin.activate()
     try:
         summary = await plugin.get_summary(None)
     finally:
