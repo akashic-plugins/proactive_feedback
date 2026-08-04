@@ -38,6 +38,24 @@ function _tone(type: string): "success" | "warning" | "danger" | "accent" | "mut
   return "muted";
 }
 
+function _feedbackTypeLabel(value: unknown): string {
+  const type = String(value || "");
+  if (type === "explicit_quote") return "明确引用";
+  if (type === "topic_follow") return "话题延续";
+  if (type === "no_topic_follow") return "未延续话题";
+  if (type === "unscored") return "待评分";
+  return type || "-";
+}
+
+function _confidenceLabel(value: unknown): string {
+  const confidence = String(value || "");
+  if (confidence === "gold") return "金标";
+  if (confidence === "high") return "高";
+  if (confidence === "medium") return "中";
+  if (confidence === "low") return "低";
+  return confidence || "-";
+}
+
 function _escape(value: unknown): string {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -55,7 +73,7 @@ function _cellText(value: unknown): string {
 function _typeCell(value: unknown): string {
   const type = String(value || "");
   const tone = type === "explicit_quote" ? "accent" : type === "topic_follow" ? "success" : type === "unscored" ? "warning" : "muted";
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(type || "-")}</span>`;
+  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(_feedbackTypeLabel(type))}</span>`;
 }
 
 function _confidenceTone(value: unknown): "success" | "warning" | "muted" {
@@ -67,7 +85,7 @@ function _confidenceTone(value: unknown): "success" | "warning" | "muted" {
 
 function _confidenceCell(value: unknown): string {
   const confidence = String(value || "-");
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(_confidenceTone(confidence))}">${_escape(confidence)}</span>`;
+  return `<span class="${window.AkashicDashboard.ui.cx.badge(_confidenceTone(confidence))}">${_escape(_confidenceLabel(confidence))}</span>`;
 }
 
 function FeedbackDetail(props: { item: Record<string, unknown> | null }): ReactElement {
@@ -85,17 +103,17 @@ function FeedbackDetail(props: { item: Record<string, unknown> | null }): ReactE
         </div>
       </div>
       <div className="detail-grid">
-        <DetailRow label="type" value={<Chip tone={_tone(type)}>{type}</Chip>} />
-        <DetailRow label="confidence" value={<Chip tone={_confidenceTone(item.confidence)}>{String(item.confidence || "-")}</Chip>} />
-        <DetailRow label="matched_by" value={<code>{String(item.matched_by || "-")}</code>} />
-        <DetailRow label="pua" value={<code>{_score(item.pua_score)}</code>} />
-        <DetailRow label="lag" value={<code>{_lag(item.lag_seconds)}</code>} />
-        <DetailRow label="proactive_id" value={<code>{String(item.proactive_message_id || "-")}</code>} />
+        <DetailRow label="反馈类型" value={<Chip tone={_tone(type)}>{_feedbackTypeLabel(type)}</Chip>} />
+        <DetailRow label="置信度" value={<Chip tone={_confidenceTone(item.confidence)}>{_confidenceLabel(item.confidence)}</Chip>} />
+        <DetailRow label="匹配方式" value={<code>{String(item.matched_by || "-")}</code>} />
+        <DetailRow label="PUA 分数" value={<code>{_score(item.pua_score)}</code>} />
+        <DetailRow label="响应延迟" value={<code>{_lag(item.lag_seconds)}</code>} />
+        <DetailRow label="主动消息 ID" value={<code>{String(item.proactive_message_id || "-")}</code>} />
       </div>
-      <TextBlock title="User Reply" text={String(item.user_reply_preview || item.user_preview || "")} />
-      {item.quoted_preview ? <TextBlock title="Quoted Proactive" text={String(item.quoted_preview)} /> : null}
-      <TextBlock title="Matched Proactive" text={String(item.proactive_preview || "")} />
-      <TextBlock title="Assistant Reply" text={String(item.assistant_preview || "")} />
+      <TextBlock title="用户回复" text={String(item.user_reply_preview || item.user_preview || "")} />
+      {item.quoted_preview ? <TextBlock title="引用的主动消息" text={String(item.quoted_preview)} /> : null}
+      <TextBlock title="命中的主动消息" text={String(item.proactive_preview || "")} />
+      <TextBlock title="助手后续回复" text={String(item.assistant_preview || "")} />
     </div>
   );
 }
@@ -115,8 +133,8 @@ function TextBlock(props: { title: string; text: string }): ReactElement {
 
 window.AkashicDashboard.registerPlugin({
   id: "proactive_feedback",
-  label: "Feedback",
-  viewLabel: "feedback",
+  label: "Feedback 反馈",
+  viewLabel: "反馈",
   pageSize: 50,
   rowKey: "id",
 
@@ -125,13 +143,13 @@ window.AkashicDashboard.registerPlugin({
   },
 
   columns: [
-    { key: "created_at", label: "Time", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
-    { key: "feedback_type", label: "Type", width: 126, renderCell: _typeCell },
-    { key: "confidence", label: "Conf", width: 84, renderCell: _confidenceCell },
+    { key: "created_at", label: "时间", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
+    { key: "feedback_type", label: "类型", width: 126, renderCell: _typeCell },
+    { key: "confidence", label: "置信度", width: 84, renderCell: _confidenceCell },
     { key: "pua_score", label: "PUA", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "lag_seconds", label: "Lag", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
-    { key: "user_reply_preview", label: "User Reply", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
-    { key: "proactive_preview", label: "Matched Proactive", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
+    { key: "lag_seconds", label: "延迟", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
+    { key: "user_reply_preview", label: "用户回复", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
+    { key: "proactive_preview", label: "命中内容", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
   ],
 
   async getCount(): Promise<number | null> {

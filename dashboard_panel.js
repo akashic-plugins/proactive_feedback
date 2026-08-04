@@ -1,4 +1,4 @@
-// ../akashic-plugin/proactive_feedback/dashboard_panel.tsx
+// dashboard_panel.tsx
 import { Chip, api } from "@akashic/dashboard-ui";
 import { jsx, jsxs } from "react/jsx-runtime";
 function _score(value) {
@@ -24,6 +24,22 @@ function _tone(type) {
   if (type === "no_topic_follow") return "muted";
   return "muted";
 }
+function _feedbackTypeLabel(value) {
+  const type = String(value || "");
+  if (type === "explicit_quote") return "\u660E\u786E\u5F15\u7528";
+  if (type === "topic_follow") return "\u8BDD\u9898\u5EF6\u7EED";
+  if (type === "no_topic_follow") return "\u672A\u5EF6\u7EED\u8BDD\u9898";
+  if (type === "unscored") return "\u5F85\u8BC4\u5206";
+  return type || "-";
+}
+function _confidenceLabel(value) {
+  const confidence = String(value || "");
+  if (confidence === "gold") return "\u91D1\u6807";
+  if (confidence === "high") return "\u9AD8";
+  if (confidence === "medium") return "\u4E2D";
+  if (confidence === "low") return "\u4F4E";
+  return confidence || "-";
+}
 function _escape(value) {
   return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
@@ -34,7 +50,7 @@ function _cellText(value) {
 function _typeCell(value) {
   const type = String(value || "");
   const tone = type === "explicit_quote" ? "accent" : type === "topic_follow" ? "success" : type === "unscored" ? "warning" : "muted";
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(type || "-")}</span>`;
+  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(_feedbackTypeLabel(type))}</span>`;
 }
 function _confidenceTone(value) {
   const confidence = String(value || "");
@@ -44,7 +60,7 @@ function _confidenceTone(value) {
 }
 function _confidenceCell(value) {
   const confidence = String(value || "-");
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(_confidenceTone(confidence))}">${_escape(confidence)}</span>`;
+  return `<span class="${window.AkashicDashboard.ui.cx.badge(_confidenceTone(confidence))}">${_escape(_confidenceLabel(confidence))}</span>`;
 }
 function FeedbackDetail(props) {
   const item = props.item;
@@ -65,17 +81,17 @@ function FeedbackDetail(props) {
       ] })
     ] }) }),
     /* @__PURE__ */ jsxs("div", { className: "detail-grid", children: [
-      /* @__PURE__ */ jsx(DetailRow, { label: "type", value: /* @__PURE__ */ jsx(Chip, { tone: _tone(type), children: type }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "confidence", value: /* @__PURE__ */ jsx(Chip, { tone: _confidenceTone(item.confidence), children: String(item.confidence || "-") }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "matched_by", value: /* @__PURE__ */ jsx("code", { children: String(item.matched_by || "-") }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "pua", value: /* @__PURE__ */ jsx("code", { children: _score(item.pua_score) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "lag", value: /* @__PURE__ */ jsx("code", { children: _lag(item.lag_seconds) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "proactive_id", value: /* @__PURE__ */ jsx("code", { children: String(item.proactive_message_id || "-") }) })
+      /* @__PURE__ */ jsx(DetailRow, { label: "\u53CD\u9988\u7C7B\u578B", value: /* @__PURE__ */ jsx(Chip, { tone: _tone(type), children: _feedbackTypeLabel(type) }) }),
+      /* @__PURE__ */ jsx(DetailRow, { label: "\u7F6E\u4FE1\u5EA6", value: /* @__PURE__ */ jsx(Chip, { tone: _confidenceTone(item.confidence), children: _confidenceLabel(item.confidence) }) }),
+      /* @__PURE__ */ jsx(DetailRow, { label: "\u5339\u914D\u65B9\u5F0F", value: /* @__PURE__ */ jsx("code", { children: String(item.matched_by || "-") }) }),
+      /* @__PURE__ */ jsx(DetailRow, { label: "PUA \u5206\u6570", value: /* @__PURE__ */ jsx("code", { children: _score(item.pua_score) }) }),
+      /* @__PURE__ */ jsx(DetailRow, { label: "\u54CD\u5E94\u5EF6\u8FDF", value: /* @__PURE__ */ jsx("code", { children: _lag(item.lag_seconds) }) }),
+      /* @__PURE__ */ jsx(DetailRow, { label: "\u4E3B\u52A8\u6D88\u606F ID", value: /* @__PURE__ */ jsx("code", { children: String(item.proactive_message_id || "-") }) })
     ] }),
-    /* @__PURE__ */ jsx(TextBlock, { title: "User Reply", text: String(item.user_reply_preview || item.user_preview || "") }),
-    item.quoted_preview ? /* @__PURE__ */ jsx(TextBlock, { title: "Quoted Proactive", text: String(item.quoted_preview) }) : null,
-    /* @__PURE__ */ jsx(TextBlock, { title: "Matched Proactive", text: String(item.proactive_preview || "") }),
-    /* @__PURE__ */ jsx(TextBlock, { title: "Assistant Reply", text: String(item.assistant_preview || "") })
+    /* @__PURE__ */ jsx(TextBlock, { title: "\u7528\u6237\u56DE\u590D", text: String(item.user_reply_preview || item.user_preview || "") }),
+    item.quoted_preview ? /* @__PURE__ */ jsx(TextBlock, { title: "\u5F15\u7528\u7684\u4E3B\u52A8\u6D88\u606F", text: String(item.quoted_preview) }) : null,
+    /* @__PURE__ */ jsx(TextBlock, { title: "\u547D\u4E2D\u7684\u4E3B\u52A8\u6D88\u606F", text: String(item.proactive_preview || "") }),
+    /* @__PURE__ */ jsx(TextBlock, { title: "\u52A9\u624B\u540E\u7EED\u56DE\u590D", text: String(item.assistant_preview || "") })
   ] });
 }
 function DetailRow(props) {
@@ -92,21 +108,21 @@ function TextBlock(props) {
 }
 window.AkashicDashboard.registerPlugin({
   id: "proactive_feedback",
-  label: "Feedback",
-  viewLabel: "feedback",
+  label: "Feedback \u53CD\u9988",
+  viewLabel: "\u53CD\u9988",
   pageSize: 50,
   rowKey: "id",
   countTitle(total) {
     return `\u5171 ${total} \u6761\u53CD\u9988`;
   },
   columns: [
-    { key: "created_at", label: "Time", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
-    { key: "feedback_type", label: "Type", width: 126, renderCell: _typeCell },
-    { key: "confidence", label: "Conf", width: 84, renderCell: _confidenceCell },
+    { key: "created_at", label: "\u65F6\u95F4", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
+    { key: "feedback_type", label: "\u7C7B\u578B", width: 126, renderCell: _typeCell },
+    { key: "confidence", label: "\u7F6E\u4FE1\u5EA6", width: 84, renderCell: _confidenceCell },
     { key: "pua_score", label: "PUA", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
-    { key: "lag_seconds", label: "Lag", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
-    { key: "user_reply_preview", label: "User Reply", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
-    { key: "proactive_preview", label: "Matched Proactive", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true }
+    { key: "lag_seconds", label: "\u5EF6\u8FDF", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
+    { key: "user_reply_preview", label: "\u7528\u6237\u56DE\u590D", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
+    { key: "proactive_preview", label: "\u547D\u4E2D\u5185\u5BB9", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true }
   ],
   async getCount() {
     try {
