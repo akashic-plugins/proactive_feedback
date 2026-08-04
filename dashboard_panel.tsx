@@ -95,46 +95,61 @@ function FeedbackDetail(props: { item: Record<string, unknown> | null }): ReactE
   }
   const type = String(item.feedback_type || "");
   return (
-    <div className="detail-wrap">
-      <div className="detail-toolbar">
+    <main className="feedback-detail" aria-labelledby="feedback-detail-title">
+      <header className="feedback-detail__header">
         <div>
-          <div className="detail-title">反馈链路</div>
-          <div className="detail-subtext">{String(item.session_key || "")} · {String(item.user_message_id || "")}</div>
+          <p>主动消息效果</p>
+          <h2 id="feedback-detail-title">用户如何回应这次主动触达</h2>
+          <span>{String(item.session_key || "未关联会话")}</span>
         </div>
-      </div>
-      <div className="detail-grid">
-        <DetailRow label="反馈类型" value={<Chip tone={_tone(type)}>{_feedbackTypeLabel(type)}</Chip>} />
-        <DetailRow label="置信度" value={<Chip tone={_confidenceTone(item.confidence)}>{_confidenceLabel(item.confidence)}</Chip>} />
-        <DetailRow label="匹配方式" value={<code>{String(item.matched_by || "-")}</code>} />
-        <DetailRow label="PUA 分数" value={<code>{_score(item.pua_score)}</code>} />
-        <DetailRow label="响应延迟" value={<code>{_lag(item.lag_seconds)}</code>} />
-        <DetailRow label="主动消息 ID" value={<code>{String(item.proactive_message_id || "-")}</code>} />
-      </div>
-      <TextBlock title="用户回复" text={String(item.user_reply_preview || item.user_preview || "")} />
-      {item.quoted_preview ? <TextBlock title="引用的主动消息" text={String(item.quoted_preview)} /> : null}
-      <TextBlock title="命中的主动消息" text={String(item.proactive_preview || "")} />
-      <TextBlock title="助手后续回复" text={String(item.assistant_preview || "")} />
-    </div>
+        <Chip tone={_tone(type)}>{_feedbackTypeLabel(type)}</Chip>
+      </header>
+
+      <section className="feedback-summary" aria-label="反馈判断摘要">
+        <SummaryMetric label="置信度" value={_confidenceLabel(item.confidence)} />
+        <SummaryMetric label="响应延迟" value={_lag(item.lag_seconds)} />
+        <SummaryMetric label="PUA 分数" value={_score(item.pua_score)} />
+      </section>
+
+      <section className="feedback-timeline" aria-labelledby="feedback-timeline-title">
+        <h3 id="feedback-timeline-title">对话链路</h3>
+        <TimelineStep index="1" title="主动消息" text={String(item.proactive_preview || item.quoted_preview || "")} />
+        <TimelineStep index="2" title="用户反馈" text={String(item.user_reply_preview || item.user_preview || "")} emphasis />
+        <TimelineStep index="3" title="助手后续" text={String(item.assistant_preview || "")} />
+      </section>
+
+      <details className="feedback-technical">
+        <summary>查看匹配依据与消息标识</summary>
+        <dl>
+          <div><dt>匹配方式</dt><dd>{String(item.matched_by || "-")}</dd></div>
+          <div><dt>用户消息 ID</dt><dd>{String(item.user_message_id || "-")}</dd></div>
+          <div><dt>主动消息 ID</dt><dd>{String(item.proactive_message_id || "-")}</dd></div>
+        </dl>
+      </details>
+    </main>
   );
 }
 
-function DetailRow(props: { label: string; value: ReactElement }): ReactElement {
-  return <div className="detail-row"><div className="detail-row-label">{props.label}</div><div className="detail-row-val">{props.value}</div></div>;
+function SummaryMetric(props: { label: string; value: string }): ReactElement {
+  return <div><span>{props.label}</span><strong>{props.value}</strong></div>;
 }
 
-function TextBlock(props: { title: string; text: string }): ReactElement {
+function TimelineStep(props: { index: string; title: string; text: string; emphasis?: boolean }): ReactElement {
   return (
-    <div className="detail-block">
-      <div className="detail-label">{props.title}</div>
-      <div className="detail-content ak-plugin-pre-wrap">{props.text || "-"}</div>
+    <div className={`feedback-step${props.emphasis ? " is-emphasis" : ""}`}>
+      <span className="feedback-step__index">{props.index}</span>
+      <div>
+        <h4>{props.title}</h4>
+        <p>{props.text || "没有可展示的内容"}</p>
+      </div>
     </div>
   );
 }
 
 window.AkashicDashboard.registerPlugin({
   id: "proactive_feedback",
-  label: "Feedback 反馈",
-  viewLabel: "反馈",
+  label: "主动反馈",
+  viewLabel: "主动反馈",
   pageSize: 50,
   rowKey: "id",
 
@@ -146,7 +161,6 @@ window.AkashicDashboard.registerPlugin({
     { key: "created_at", label: "时间", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
     { key: "feedback_type", label: "类型", width: 126, renderCell: _typeCell },
     { key: "confidence", label: "置信度", width: 84, renderCell: _confidenceCell },
-    { key: "pua_score", label: "PUA", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
     { key: "lag_seconds", label: "延迟", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
     { key: "user_reply_preview", label: "用户回复", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
     { key: "proactive_preview", label: "命中内容", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },

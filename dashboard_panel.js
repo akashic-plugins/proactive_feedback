@@ -1,4 +1,4 @@
-// dashboard_panel.tsx
+// ../proactive_feedback/dashboard_panel.tsx
 import { Chip, api } from "@akashic/dashboard-ui";
 import { jsx, jsxs } from "react/jsx-runtime";
 function _score(value) {
@@ -71,45 +71,64 @@ function FeedbackDetail(props) {
     ] });
   }
   const type = String(item.feedback_type || "");
-  return /* @__PURE__ */ jsxs("div", { className: "detail-wrap", children: [
-    /* @__PURE__ */ jsx("div", { className: "detail-toolbar", children: /* @__PURE__ */ jsxs("div", { children: [
-      /* @__PURE__ */ jsx("div", { className: "detail-title", children: "\u53CD\u9988\u94FE\u8DEF" }),
-      /* @__PURE__ */ jsxs("div", { className: "detail-subtext", children: [
-        String(item.session_key || ""),
-        " \xB7 ",
-        String(item.user_message_id || "")
-      ] })
-    ] }) }),
-    /* @__PURE__ */ jsxs("div", { className: "detail-grid", children: [
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u53CD\u9988\u7C7B\u578B", value: /* @__PURE__ */ jsx(Chip, { tone: _tone(type), children: _feedbackTypeLabel(type) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u7F6E\u4FE1\u5EA6", value: /* @__PURE__ */ jsx(Chip, { tone: _confidenceTone(item.confidence), children: _confidenceLabel(item.confidence) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u5339\u914D\u65B9\u5F0F", value: /* @__PURE__ */ jsx("code", { children: String(item.matched_by || "-") }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "PUA \u5206\u6570", value: /* @__PURE__ */ jsx("code", { children: _score(item.pua_score) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u54CD\u5E94\u5EF6\u8FDF", value: /* @__PURE__ */ jsx("code", { children: _lag(item.lag_seconds) }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "\u4E3B\u52A8\u6D88\u606F ID", value: /* @__PURE__ */ jsx("code", { children: String(item.proactive_message_id || "-") }) })
+  return /* @__PURE__ */ jsxs("main", { className: "feedback-detail", "aria-labelledby": "feedback-detail-title", children: [
+    /* @__PURE__ */ jsxs("header", { className: "feedback-detail__header", children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("p", { children: "\u4E3B\u52A8\u6D88\u606F\u6548\u679C" }),
+        /* @__PURE__ */ jsx("h2", { id: "feedback-detail-title", children: "\u7528\u6237\u5982\u4F55\u56DE\u5E94\u8FD9\u6B21\u4E3B\u52A8\u89E6\u8FBE" }),
+        /* @__PURE__ */ jsx("span", { children: String(item.session_key || "\u672A\u5173\u8054\u4F1A\u8BDD") })
+      ] }),
+      /* @__PURE__ */ jsx(Chip, { tone: _tone(type), children: _feedbackTypeLabel(type) })
     ] }),
-    /* @__PURE__ */ jsx(TextBlock, { title: "\u7528\u6237\u56DE\u590D", text: String(item.user_reply_preview || item.user_preview || "") }),
-    item.quoted_preview ? /* @__PURE__ */ jsx(TextBlock, { title: "\u5F15\u7528\u7684\u4E3B\u52A8\u6D88\u606F", text: String(item.quoted_preview) }) : null,
-    /* @__PURE__ */ jsx(TextBlock, { title: "\u547D\u4E2D\u7684\u4E3B\u52A8\u6D88\u606F", text: String(item.proactive_preview || "") }),
-    /* @__PURE__ */ jsx(TextBlock, { title: "\u52A9\u624B\u540E\u7EED\u56DE\u590D", text: String(item.assistant_preview || "") })
+    /* @__PURE__ */ jsxs("section", { className: "feedback-summary", "aria-label": "\u53CD\u9988\u5224\u65AD\u6458\u8981", children: [
+      /* @__PURE__ */ jsx(SummaryMetric, { label: "\u7F6E\u4FE1\u5EA6", value: _confidenceLabel(item.confidence) }),
+      /* @__PURE__ */ jsx(SummaryMetric, { label: "\u54CD\u5E94\u5EF6\u8FDF", value: _lag(item.lag_seconds) }),
+      /* @__PURE__ */ jsx(SummaryMetric, { label: "PUA \u5206\u6570", value: _score(item.pua_score) })
+    ] }),
+    /* @__PURE__ */ jsxs("section", { className: "feedback-timeline", "aria-labelledby": "feedback-timeline-title", children: [
+      /* @__PURE__ */ jsx("h3", { id: "feedback-timeline-title", children: "\u5BF9\u8BDD\u94FE\u8DEF" }),
+      /* @__PURE__ */ jsx(TimelineStep, { index: "1", title: "\u4E3B\u52A8\u6D88\u606F", text: String(item.proactive_preview || item.quoted_preview || "") }),
+      /* @__PURE__ */ jsx(TimelineStep, { index: "2", title: "\u7528\u6237\u53CD\u9988", text: String(item.user_reply_preview || item.user_preview || ""), emphasis: true }),
+      /* @__PURE__ */ jsx(TimelineStep, { index: "3", title: "\u52A9\u624B\u540E\u7EED", text: String(item.assistant_preview || "") })
+    ] }),
+    /* @__PURE__ */ jsxs("details", { className: "feedback-technical", children: [
+      /* @__PURE__ */ jsx("summary", { children: "\u67E5\u770B\u5339\u914D\u4F9D\u636E\u4E0E\u6D88\u606F\u6807\u8BC6" }),
+      /* @__PURE__ */ jsxs("dl", { children: [
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("dt", { children: "\u5339\u914D\u65B9\u5F0F" }),
+          /* @__PURE__ */ jsx("dd", { children: String(item.matched_by || "-") })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("dt", { children: "\u7528\u6237\u6D88\u606F ID" }),
+          /* @__PURE__ */ jsx("dd", { children: String(item.user_message_id || "-") })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("dt", { children: "\u4E3B\u52A8\u6D88\u606F ID" }),
+          /* @__PURE__ */ jsx("dd", { children: String(item.proactive_message_id || "-") })
+        ] })
+      ] })
+    ] })
   ] });
 }
-function DetailRow(props) {
-  return /* @__PURE__ */ jsxs("div", { className: "detail-row", children: [
-    /* @__PURE__ */ jsx("div", { className: "detail-row-label", children: props.label }),
-    /* @__PURE__ */ jsx("div", { className: "detail-row-val", children: props.value })
+function SummaryMetric(props) {
+  return /* @__PURE__ */ jsxs("div", { children: [
+    /* @__PURE__ */ jsx("span", { children: props.label }),
+    /* @__PURE__ */ jsx("strong", { children: props.value })
   ] });
 }
-function TextBlock(props) {
-  return /* @__PURE__ */ jsxs("div", { className: "detail-block", children: [
-    /* @__PURE__ */ jsx("div", { className: "detail-label", children: props.title }),
-    /* @__PURE__ */ jsx("div", { className: "detail-content ak-plugin-pre-wrap", children: props.text || "-" })
+function TimelineStep(props) {
+  return /* @__PURE__ */ jsxs("div", { className: `feedback-step${props.emphasis ? " is-emphasis" : ""}`, children: [
+    /* @__PURE__ */ jsx("span", { className: "feedback-step__index", children: props.index }),
+    /* @__PURE__ */ jsxs("div", { children: [
+      /* @__PURE__ */ jsx("h4", { children: props.title }),
+      /* @__PURE__ */ jsx("p", { children: props.text || "\u6CA1\u6709\u53EF\u5C55\u793A\u7684\u5185\u5BB9" })
+    ] })
   ] });
 }
 window.AkashicDashboard.registerPlugin({
   id: "proactive_feedback",
-  label: "Feedback \u53CD\u9988",
-  viewLabel: "\u53CD\u9988",
+  label: "\u4E3B\u52A8\u53CD\u9988",
+  viewLabel: "\u4E3B\u52A8\u53CD\u9988",
   pageSize: 50,
   rowKey: "id",
   countTitle(total) {
@@ -119,7 +138,6 @@ window.AkashicDashboard.registerPlugin({
     { key: "created_at", label: "\u65F6\u95F4", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
     { key: "feedback_type", label: "\u7C7B\u578B", width: 126, renderCell: _typeCell },
     { key: "confidence", label: "\u7F6E\u4FE1\u5EA6", width: 84, renderCell: _confidenceCell },
-    { key: "pua_score", label: "PUA", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
     { key: "lag_seconds", label: "\u5EF6\u8FDF", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
     { key: "user_reply_preview", label: "\u7528\u6237\u56DE\u590D", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
     { key: "proactive_preview", label: "\u547D\u4E2D\u5185\u5BB9", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true }
