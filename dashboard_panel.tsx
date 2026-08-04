@@ -58,6 +58,18 @@ function _typeCell(value: unknown): string {
   return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(type || "-")}</span>`;
 }
 
+function _confidenceTone(value: unknown): "success" | "warning" | "muted" {
+  const confidence = String(value || "");
+  if (confidence === "gold" || confidence === "high") return "success";
+  if (confidence === "medium") return "warning";
+  return "muted";
+}
+
+function _confidenceCell(value: unknown): string {
+  const confidence = String(value || "-");
+  return `<span class="${window.AkashicDashboard.ui.cx.badge(_confidenceTone(confidence))}">${_escape(confidence)}</span>`;
+}
+
 function FeedbackDetail(props: { item: Record<string, unknown> | null }): ReactElement {
   const item = props.item;
   if (!item) {
@@ -74,7 +86,7 @@ function FeedbackDetail(props: { item: Record<string, unknown> | null }): ReactE
       </div>
       <div className="detail-grid">
         <DetailRow label="type" value={<Chip tone={_tone(type)}>{type}</Chip>} />
-        <DetailRow label="confidence" value={<code>{String(item.confidence || "-")}</code>} />
+        <DetailRow label="confidence" value={<Chip tone={_confidenceTone(item.confidence)}>{String(item.confidence || "-")}</Chip>} />
         <DetailRow label="matched_by" value={<code>{String(item.matched_by || "-")}</code>} />
         <DetailRow label="pua" value={<code>{_score(item.pua_score)}</code>} />
         <DetailRow label="lag" value={<code>{_lag(item.lag_seconds)}</code>} />
@@ -115,7 +127,7 @@ window.AkashicDashboard.registerPlugin({
   columns: [
     { key: "created_at", label: "Time", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
     { key: "feedback_type", label: "Type", width: 126, renderCell: _typeCell },
-    { key: "confidence", label: "Conf", width: 72, cellClass: "mono cell-metric" },
+    { key: "confidence", label: "Conf", width: 84, renderCell: _confidenceCell },
     { key: "pua_score", label: "PUA", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
     { key: "lag_seconds", label: "Lag", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
     { key: "user_reply_preview", label: "User Reply", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },

@@ -36,6 +36,16 @@ function _typeCell(value) {
   const tone = type === "explicit_quote" ? "accent" : type === "topic_follow" ? "success" : type === "unscored" ? "warning" : "muted";
   return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(type || "-")}</span>`;
 }
+function _confidenceTone(value) {
+  const confidence = String(value || "");
+  if (confidence === "gold" || confidence === "high") return "success";
+  if (confidence === "medium") return "warning";
+  return "muted";
+}
+function _confidenceCell(value) {
+  const confidence = String(value || "-");
+  return `<span class="${window.AkashicDashboard.ui.cx.badge(_confidenceTone(confidence))}">${_escape(confidence)}</span>`;
+}
 function FeedbackDetail(props) {
   const item = props.item;
   if (!item) {
@@ -56,7 +66,7 @@ function FeedbackDetail(props) {
     ] }) }),
     /* @__PURE__ */ jsxs("div", { className: "detail-grid", children: [
       /* @__PURE__ */ jsx(DetailRow, { label: "type", value: /* @__PURE__ */ jsx(Chip, { tone: _tone(type), children: type }) }),
-      /* @__PURE__ */ jsx(DetailRow, { label: "confidence", value: /* @__PURE__ */ jsx("code", { children: String(item.confidence || "-") }) }),
+      /* @__PURE__ */ jsx(DetailRow, { label: "confidence", value: /* @__PURE__ */ jsx(Chip, { tone: _confidenceTone(item.confidence), children: String(item.confidence || "-") }) }),
       /* @__PURE__ */ jsx(DetailRow, { label: "matched_by", value: /* @__PURE__ */ jsx("code", { children: String(item.matched_by || "-") }) }),
       /* @__PURE__ */ jsx(DetailRow, { label: "pua", value: /* @__PURE__ */ jsx("code", { children: _score(item.pua_score) }) }),
       /* @__PURE__ */ jsx(DetailRow, { label: "lag", value: /* @__PURE__ */ jsx("code", { children: _lag(item.lag_seconds) }) }),
@@ -92,7 +102,7 @@ window.AkashicDashboard.registerPlugin({
   columns: [
     { key: "created_at", label: "Time", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
     { key: "feedback_type", label: "Type", width: 126, renderCell: _typeCell },
-    { key: "confidence", label: "Conf", width: 72, cellClass: "mono cell-metric" },
+    { key: "confidence", label: "Conf", width: 84, renderCell: _confidenceCell },
     { key: "pua_score", label: "PUA", width: 66, fmt: "score", cellClass: "mono cell-metric", align: "right" },
     { key: "lag_seconds", label: "Lag", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
     { key: "user_reply_preview", label: "User Reply", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
