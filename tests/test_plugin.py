@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,6 +38,7 @@ def _plugin_context(tmp_path: Path) -> PluginContext:
         kv_store=PluginKVStore(tmp_path / ".kv.json"),
         workspace=tmp_path,
         scope=scope,
+        _can_start_tasks=lambda: True,
     )
 
 
@@ -58,6 +60,7 @@ async def test_proactive_feedback_summary_empty(tmp_path: Path) -> None:
         kv_store=PluginKVStore(tmp_path / ".kv.json"),
         workspace=tmp_path,
         scope=scope,
+        _can_start_tasks=lambda: True,
     )
     plugin.activate()
     try:
@@ -115,6 +118,42 @@ def test_get_embedder_uses_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     assert embedder is plugin._embedder
     assert seen == [tmp_path]
+
+
+def test_build_embedder_uses_runtime_config_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "runtime.toml"
+    seen: list[tuple[Path, Path]] = []
+    embedding = SimpleNamespace(
+        base_url="https://embedding.example/v1",
+        api_key="test-key",
+        model="text-embedding-v3",
+        output_dimensionality=1024,
+    )
+
+    def fake_load(path: str | Path, *, workspace: str | Path) -> object:
+        seen.append((Path(path), Path(workspace)))
+        return SimpleNamespace(memory=SimpleNamespace(embedding=embedding))
+
+    class FakeEmbedder:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("AKASHIC_CONFIG", str(config_path))
+    monkeypatch.setattr(module.Config, "load", fake_load)
+    monkeypatch.setattr(module, "Embedder", FakeEmbedder)
+
+    embedder = module._build_embedder(tmp_path)
+
+    assert seen == [(config_path, tmp_path)]
+    assert embedder.kwargs == {
+        "base_url": embedding.base_url,
+        "api_key": embedding.api_key,
+        "model": embedding.model,
+        "output_dimensionality": embedding.output_dimensionality,
+    }
 
 
 def test_mobile_contribution_declares_dashboard() -> None:

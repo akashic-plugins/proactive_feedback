@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 from contextlib import suppress
 from pathlib import Path
@@ -280,7 +281,8 @@ class ProactiveFeedbackPlugin(Plugin):
 
 
 def _build_embedder(workspace: Path) -> Embedder:
-    embedding = Config.load(workspace=workspace).memory.embedding
+    config_path = os.environ.get("AKASHIC_CONFIG", "config.toml")
+    embedding = Config.load(config_path, workspace=workspace).memory.embedding
     return Embedder(
         base_url=embedding.base_url,
         api_key=embedding.api_key,
