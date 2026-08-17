@@ -11,7 +11,11 @@ Akashic proactive feedback plugin.
 - 反馈数据库由 Core 分配的 `ctx.data_root` 独占，Dashboard 与 Mobile 只读同一投影；
 - `apply` 不读取或写入正式 `sessions.db`，候选期不会访问正式 Session；候选没有
   反馈 DB 时也不会为了重放而创建文件；已提交 Turn 的 inbox 只保存
-  session/turn/message identity，不保存 user/assistant 正文。
+  session/turn/message identity，不保存 user/assistant 正文。Core 正式 generation
+  启动时会在最多 64 个既有 session、最多 256 个 Turn 的边界内用 `SESSION_READ`
+  重新发现已提交但尚未进入 inbox 的 eligible Turn；只把 ordered user IDs 和
+  assistant ID 写入 inbox，正文只在评分内存中重建。候选 generation 不执行 discovery，
+  因而不会写正式 DB 或事件。
 
 ### Durable typed event
 
@@ -22,7 +26,8 @@ Core exact `20062a715d2c5822228b327863b51c8d036119b3` 提供唯一的
 `ctx.observe(PROACTIVE_FEEDBACK_COMMITTED, ProactiveFeedbackCommitted(...))`。
 
 事件 `event_id` 固定为 `proactive_feedback:<row_id>`，DTO 使用 Core 的
-`session_key`、user/assistant/proactive message identity、评分、`reason` 和最多
+`session_key`、ordered user message identity（DTO 使用该 Turn 最后一条 user ID）、
+assistant/proactive message identity、评分、`reason` 和最多
 2400 字符的 user/assistant/proactive preview。全文不进入事件。发布成功后同库的
 `proactive_feedback_published_cursor` 与 outbox receipt 一起推进；发布失败、进程内
 取消或 Core 重启都会保留 pending 行，正式 generation 启动时按 row 顺序重放。消费方

@@ -43,6 +43,7 @@ class FeedbackInputRecord:
     turn_id: str
     client_message_id: str
     user_message_id: str
+    user_message_ids: tuple[str, ...]
     assistant_message_id: str | None
 
 
@@ -95,6 +96,7 @@ def open_db(path: Path) -> sqlite3.Connection:
             turn_id TEXT NOT NULL DEFAULT '',
             client_message_id TEXT NOT NULL DEFAULT '',
             user_message_id TEXT NOT NULL,
+            user_message_ids_json TEXT NOT NULL DEFAULT '[]',
             assistant_message_id TEXT,
             processed_at TEXT,
             UNIQUE(session_key, user_message_id)
@@ -102,6 +104,11 @@ def open_db(path: Path) -> sqlite3.Connection:
 
         CREATE INDEX IF NOT EXISTS idx_pfe_input_pending
         ON proactive_feedback_input_inbox(processed_at, id);
+
+        CREATE TABLE IF NOT EXISTS proactive_feedback_session_catalog (
+            session_key TEXT PRIMARY KEY,
+            discovered_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
 
         CREATE TABLE IF NOT EXISTS proactive_feedback_outbox (
             row_id INTEGER PRIMARY KEY,
@@ -124,6 +131,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     _ensure_column(conn, "user_content_preview")
     _ensure_column(conn, "assistant_content_preview")
     _ensure_column(conn, "proactive_content_preview")
+    _ensure_input_column(conn, "user_message_ids_json")
     conn.commit()
     return conn
 
@@ -168,12 +176,19 @@ def insert_feedback_input(
     client_message_id: str,
     user_message_id: str,
     assistant_message_id: str | None,
+    user_message_ids: tuple[str, ...] | None = None,
 ) -> int:
     """Durably record one committed Turn identity without storing message text."""
 
     # 1. Validate the identity that the recovery reader will use.
     _required_input_text(session_key, "session_key")
     _required_input_text(user_message_id, "user_message_id")
+    ordered_user_ids = (
+        (user_message_id,) if user_message_ids is None else user_message_ids
+    )
+    _validate_user_message_ids(ordered_user_ids)
+    if ordered_user_ids[-1] != user_message_id:
+        raise ValueError("input inbox user_message_id 必须是 ordered IDs 的最后一项")
     _optional_input_text(turn_id, "turn_id")
     _optional_input_text(client_message_id, "client_message_id")
     if assistant_message_id is not None:
@@ -182,7 +197,7 @@ def insert_feedback_input(
     # 2. Preserve one durable row for duplicate committed events.
     existing = conn.execute(
         """
-        SELECT id
+        SELECT id, processed_at, user_message_ids_json
         FROM proactive_feedback_input_inbox
         WHERE session_key = ? AND user_message_id = ?
         LIMIT 1
@@ -190,27 +205,51 @@ def insert_feedback_input(
         (session_key, user_message_id),
     ).fetchone()
     if existing is not None:
+        if existing["processed_at"] is None and _decode_user_message_ids(
+            existing["user_message_ids_json"], user_message_id
+        ) != ordered_user_ids:
+            _ = conn.execute(
+                """
+                UPDATE proactive_feedback_input_inbox
+                SET user_message_ids_json = ?, assistant_message_id = ?
+                WHERE id = ? AND processed_at IS NULL
+                """,
+                (
+                    json.dumps(ordered_user_ids, ensure_ascii=False),
+                    assistant_message_id,
+                    int(existing["id"]),
+                ),
+            )
+            conn.commit()
         return int(existing["id"])
     try:
         cursor = conn.execute(
             """
             INSERT INTO proactive_feedback_input_inbox(
                 session_key, turn_id, client_message_id,
-                user_message_id, assistant_message_id
+                user_message_id, user_message_ids_json, assistant_message_id
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 session_key,
                 turn_id,
                 client_message_id,
                 user_message_id,
+                json.dumps(ordered_user_ids, ensure_ascii=False),
                 assistant_message_id,
             ),
         )
         if cursor.lastrowid is None:
             raise RuntimeError("feedback input insert failed")
         row_id = int(cursor.lastrowid)
+        _ = conn.execute(
+            """
+            INSERT OR IGNORE INTO proactive_feedback_session_catalog(session_key)
+            VALUES (?)
+            """,
+            (session_key,),
+        )
         conn.commit()
         return row_id
     except (sqlite3.Error, RuntimeError, ValueError):
@@ -231,7 +270,7 @@ def pending_feedback_inputs(
     rows = conn.execute(
         """
         SELECT id, session_key, turn_id, client_message_id,
-               user_message_id, assistant_message_id
+               user_message_id, user_message_ids_json, assistant_message_id
         FROM proactive_feedback_input_inbox
         WHERE processed_at IS NULL
         ORDER BY id ASC
@@ -254,7 +293,7 @@ def pending_feedback_input(
     row = conn.execute(
         """
         SELECT id, session_key, turn_id, client_message_id,
-               user_message_id, assistant_message_id
+               user_message_id, user_message_ids_json, assistant_message_id
         FROM proactive_feedback_input_inbox
         WHERE id = ? AND processed_at IS NULL
         """,
@@ -290,6 +329,47 @@ def mark_feedback_input_processed(
             conn.rollback()
             raise RuntimeError("input inbox receipt 不匹配 pending row")
     conn.commit()
+
+
+def feedback_session_keys(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 64,
+) -> tuple[str, ...]:
+    """Read the bounded durable session-key catalog used by formal recovery."""
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("session catalog limit 必须是正整数")
+    rows = conn.execute(
+        """
+        SELECT session_key
+        FROM proactive_feedback_session_catalog
+        ORDER BY discovered_at ASC, session_key ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return tuple(str(row["session_key"]) for row in rows)
+
+
+def feedback_identity_exists(
+    conn: sqlite3.Connection,
+    *,
+    session_key: str,
+    user_message_id: str,
+) -> bool:
+    """Check whether a feedback projection already owns one user identity."""
+
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM proactive_feedback_events
+        WHERE session_key = ? AND user_message_id = ?
+        LIMIT 1
+        """,
+        (session_key, user_message_id),
+    ).fetchone()
+    return row is not None
 
 
 def _feedback_owned_by_other(
@@ -491,12 +571,16 @@ def _feedback_payload(event_id: str, event: FeedbackEvent) -> dict[str, object]:
 
 
 def _feedback_input_record(row: sqlite3.Row) -> FeedbackInputRecord:
+    user_message_id = str(row["user_message_id"])
     return FeedbackInputRecord(
         row_id=int(row["id"]),
         session_key=str(row["session_key"]),
         turn_id=str(row["turn_id"]),
         client_message_id=str(row["client_message_id"]),
-        user_message_id=str(row["user_message_id"]),
+        user_message_id=user_message_id,
+        user_message_ids=_decode_user_message_ids(
+            row["user_message_ids_json"], user_message_id
+        ),
         assistant_message_id=(
             None
             if row["assistant_message_id"] is None
@@ -517,6 +601,44 @@ def _optional_input_text(value: str, field: str) -> None:
         raise TypeError(f"input inbox {field} 必须是字符串")
     if value != value.strip():
         raise ValueError(f"input inbox {field} 不能有首尾空白")
+
+
+def _validate_user_message_ids(user_message_ids: tuple[str, ...]) -> None:
+    if not user_message_ids:
+        raise ValueError("input inbox user_message_ids 不能为空")
+    if len(set(user_message_ids)) != len(user_message_ids):
+        raise ValueError("input inbox user_message_ids 不能重复")
+    for message_id in user_message_ids:
+        _required_input_text(message_id, "user_message_id")
+
+
+def _decode_user_message_ids(value: object, fallback: str) -> tuple[str, ...]:
+    if isinstance(value, str) and value:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = None
+        if decoded and isinstance(decoded, list) and all(
+            isinstance(item, str) and item for item in decoded
+        ):
+            ids = tuple(decoded)
+            if len(set(ids)) == len(ids) and ids[-1] == fallback:
+                return ids
+    return (fallback,)
+
+
+def _ensure_input_column(conn: sqlite3.Connection, name: str) -> None:
+    columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(proactive_feedback_input_inbox)"
+        )
+    }
+    if name not in columns:
+        _ = conn.execute(
+            "ALTER TABLE proactive_feedback_input_inbox "
+            "ADD COLUMN user_message_ids_json TEXT NOT NULL DEFAULT '[]'"
+        )
 
 
 def pending_feedback_outbox(

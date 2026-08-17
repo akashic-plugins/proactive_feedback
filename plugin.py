@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any, cast
 
@@ -31,6 +31,8 @@ from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
     FeedbackEvent,
     FeedbackInputRecord,
+    feedback_identity_exists,
+    feedback_session_keys,
     insert_feedback,
     insert_feedback_input,
     mark_feedback_input_processed,
@@ -42,7 +44,6 @@ from .db import (
 )
 from .scorer import (
     MessageRow,
-    latest_turn_messages_from_rows,
     message_rows_from_snapshot,
     parse_quote_parts,
     proactive_since_previous_user_from_rows,
@@ -57,6 +58,8 @@ _FEEDBACK_DB_NAME = "proactive_feedback.db"
 _PREVIEW_MAX_CHARS = 2400
 _OUTBOX_BATCH_SIZE = 100
 _OUTBOX_RETRY_SECONDS = 1.0
+_DISCOVERY_SESSION_LIMIT = 64
+_DISCOVERY_TURN_LIMIT = 256
 
 FeedbackPublisher = Callable[[ProactiveFeedbackCommitted], Awaitable[None]]
 
@@ -117,21 +120,23 @@ class ProactiveFeedbackRuntime:
         workspace: Path,
         db_path: Path,
         publish_feedback: FeedbackPublisher | None = None,
+        session_keys: Callable[[], Iterable[str]] | None = None,
     ) -> None:
         self._session_read = session_read
         self._workspace = workspace
         self._db_path = db_path
         self._publish_feedback = publish_feedback
+        self._session_keys = session_keys or (
+            lambda: _formal_session_keys_from_read_service(session_read)
+        )
         self._queue: asyncio.Queue[int] = asyncio.Queue(maxsize=_QUEUE_MAX)
         self._embedder: Embedder | None = None
+        self._discovery_done = False
 
     def enqueue(self, event: TurnCommitted) -> None:
         """Durably record one committed Turn identity and wake the worker."""
 
-        if (
-            event.persisted_user_message is None
-            or event.persisted_user_message_id is None
-        ):
+        if event.persisted_user_message is None or not _event_user_message_ids(event):
             return
         input_row_id = self._persist_input(event)
         try:
@@ -145,8 +150,12 @@ class ProactiveFeedbackRuntime:
     async def run_worker(self) -> None:
         """Process queued committed turns until the owning Fiber is disposed."""
 
+        # 1. Recover a Core commit that ended before AFTER_TURN_COMMITTED.
+        if not self._discovery_done:
+            self._discover_committed_inputs()
+            self._discovery_done = True
         while True:
-            # 1. Replay every durable payload before waiting for new Turns.
+            # 2. Replay every durable payload before waiting for new Turns.
             try:
                 await self._publish_pending()
             except asyncio.CancelledError:
@@ -167,7 +176,7 @@ class ProactiveFeedbackRuntime:
                 await asyncio.sleep(_OUTBOX_RETRY_SECONDS)
                 continue
 
-            # 2. Process one Core-committed Turn and drain its transaction's outbox.
+            # 3. Process one Core-committed Turn and drain its transaction's outbox.
             input_row_id = await self._queue.get()
             try:
                 await self._process_input_row(input_row_id)
@@ -227,28 +236,21 @@ class ProactiveFeedbackRuntime:
         """Score one committed turn using a detached Session snapshot."""
 
         # 1. Resolve the committed message identity through Core's read service.
-        user_text = event.persisted_user_message
-        if not user_text or not event.assistant_response:
+        if not event.persisted_user_message or not event.assistant_response:
             self._complete_input(input_row_id)
             return
         snapshot = self._session_read.read(event.session_key)
         if snapshot is None:
             return
         rows = message_rows_from_snapshot(snapshot.messages)
-        turn = latest_turn_messages_from_rows(
-            rows,
-            user_message_id=event.persisted_user_message_id,
-            assistant_message_id=event.assistant_message_id,
-            user_content=user_text,
-            assistant_content=event.assistant_response,
-        )
+        turn = _turn_for_event(rows, event)
         if turn is None:
             logger.warning(
                 "proactive_feedback committed message missing session=%s",
                 event.session_key,
             )
             return
-        user, assistant = turn
+        user, assistant, candidate_before_seq = turn
 
         # 2. Preserve the v2 candidate window and quote matching semantics.
         quote = parse_quote_parts(user.content)
@@ -256,13 +258,13 @@ class ProactiveFeedbackRuntime:
         if quote.quoted_text:
             candidates = recent_proactive_messages_from_rows(
                 rows,
-                before_seq=user.seq,
+                before_seq=candidate_before_seq,
                 limit=64,
             )
         else:
             candidates = proactive_since_previous_user_from_rows(
                 rows,
-                before_seq=user.seq,
+                before_seq=candidate_before_seq,
                 limit=8,
             )
         if not candidates:
@@ -359,6 +361,7 @@ class ProactiveFeedbackRuntime:
             sink.close()
 
     def _persist_input(self, event: TurnCommitted) -> int:
+        user_message_ids = _event_user_message_ids(event)
         sink = open_db(self._db_path)
         try:
             return insert_feedback_input(
@@ -366,8 +369,11 @@ class ProactiveFeedbackRuntime:
                 session_key=event.session_key,
                 turn_id=event.turn_id,
                 client_message_id=event.client_message_id,
-                user_message_id=event.persisted_user_message_id or "",
+                user_message_id=(
+                    event.persisted_user_message_id or user_message_ids[-1]
+                ),
                 assistant_message_id=event.assistant_message_id,
+                user_message_ids=user_message_ids,
             )
         finally:
             sink.close()
@@ -422,14 +428,7 @@ class ProactiveFeedbackRuntime:
             )
             return
         rows = message_rows_from_snapshot(snapshot.messages)
-        user = next(
-            (
-                row
-                for row in rows
-                if row.role == "user" and row.id == record.user_message_id
-            ),
-            None,
-        )
+        user = _aggregate_user_row(rows, record.user_message_ids)
         assistant = _assistant_for_input(rows, record)
         if user is None or assistant is None:
             logger.warning(
@@ -450,6 +449,7 @@ class ProactiveFeedbackRuntime:
                 turn_id=record.turn_id,
                 client_message_id=record.client_message_id,
                 persisted_user_message_id=user.id,
+                persisted_user_message_ids=record.user_message_ids,
                 assistant_message_id=assistant.id,
             ),
             input_row_id=record.row_id,
@@ -491,9 +491,199 @@ class ProactiveFeedbackRuntime:
             self._embedder = _build_embedder(self._workspace)
         return self._embedder
 
+    def _discover_committed_inputs(self) -> None:
+        """Discover bounded eligible Turns committed before the callback fanout."""
+
+        # 1. Candidate generations never receive formal SessionRead data.
+        if getattr(self._session_read, "_lookup_existing", None) is None:
+            return
+
+        # 2. Combine the durable catalog with Core's bounded existing-session list.
+        keys: list[str] = []
+        if self._db_path.exists():
+            sink = open_db(self._db_path)
+            try:
+                keys.extend(
+                    feedback_session_keys(sink, limit=_DISCOVERY_SESSION_LIMIT)
+                )
+            finally:
+                sink.close()
+        keys.extend(self._session_keys())
+        ordered_keys = tuple(dict.fromkeys(key for key in keys if key))[
+            :_DISCOVERY_SESSION_LIMIT
+        ]
+        if not ordered_keys:
+            return
+
+        # 3. Read detached snapshots and persist identities only.
+        sink = open_db(self._db_path)
+        try:
+            discovered = 0
+            for session_key in ordered_keys:
+                snapshot = self._session_read.read(session_key)
+                if snapshot is None:
+                    continue
+                rows = message_rows_from_snapshot(snapshot.messages)
+                for user_ids, assistant_id in _iter_discovered_turns(rows):
+                    if discovered >= _DISCOVERY_TURN_LIMIT:
+                        return
+                    if feedback_identity_exists(
+                        sink,
+                        session_key=session_key,
+                        user_message_id=user_ids[-1],
+                    ):
+                        continue
+                    _ = insert_feedback_input(
+                        sink,
+                        session_key=session_key,
+                        turn_id="",
+                        client_message_id="",
+                        user_message_id=user_ids[-1],
+                        user_message_ids=user_ids,
+                        assistant_message_id=assistant_id,
+                    )
+                    discovered += 1
+        finally:
+            sink.close()
+
 
 def _bounded_preview(value: str, limit: int = _PREVIEW_MAX_CHARS) -> str:
     return value[:limit]
+
+
+def _event_user_message_ids(event: TurnCommitted) -> tuple[str, ...]:
+    if event.persisted_user_message_ids:
+        return tuple(event.persisted_user_message_ids)
+    if event.persisted_user_message_id is not None:
+        return (event.persisted_user_message_id,)
+    return ()
+
+
+def _turn_for_event(
+    rows: list[MessageRow],
+    event: TurnCommitted,
+) -> tuple[MessageRow, MessageRow, int] | None:
+    user_ids = _event_user_message_ids(event)
+    user = _aggregate_user_row(
+        rows,
+        user_ids,
+        expected_content=event.persisted_user_message,
+    )
+    if user is None:
+        return None
+    assistant = _assistant_for_event(rows, event)
+    if assistant is None:
+        return None
+    first_user = min(
+        (row.seq for row in rows if row.role == "user" and row.id in user_ids),
+        default=user.seq,
+    )
+    return user, assistant, first_user
+
+
+def _aggregate_user_row(
+    rows: list[MessageRow],
+    user_message_ids: tuple[str, ...],
+    *,
+    expected_content: str | None = None,
+) -> MessageRow | None:
+    if not user_message_ids or len(set(user_message_ids)) != len(user_message_ids):
+        return None
+    by_id = {row.id: row for row in rows if row.role == "user"}
+    user_rows = [by_id[message_id] for message_id in user_message_ids if message_id in by_id]
+    if len(user_rows) != len(user_message_ids):
+        return None
+    content = "\n\n".join(row.content for row in user_rows)
+    if expected_content is not None and content != expected_content:
+        return None
+    last = user_rows[-1]
+    return MessageRow(
+        id=last.id,
+        seq=last.seq,
+        role=last.role,
+        content=content,
+        extra=last.extra,
+        ts=last.ts,
+    )
+
+
+def _assistant_for_event(
+    rows: list[MessageRow],
+    event: TurnCommitted,
+) -> MessageRow | None:
+    candidates = [row for row in rows if row.role == "assistant"]
+    if event.assistant_message_id is not None:
+        candidates = [
+            row for row in candidates if row.id == event.assistant_message_id
+        ]
+    else:
+        candidates = [
+            row for row in candidates if row.content == event.assistant_response
+        ]
+    if event.assistant_response:
+        candidates = [
+            row for row in candidates if row.content == event.assistant_response
+        ]
+    return max(candidates, key=lambda row: row.seq, default=None)
+
+
+def _iter_discovered_turns(
+    rows: list[MessageRow],
+) -> Iterable[tuple[tuple[str, ...], str]]:
+    """Yield bounded eligible committed Turn identities from a detached snapshot."""
+
+    ordered = sorted(rows, key=lambda row: row.seq)
+    previous_assistant_seq = -1
+    for assistant in (row for row in ordered if row.role == "assistant"):
+        users = [
+            row
+            for row in ordered
+            if row.role == "user"
+            and previous_assistant_seq < row.seq < assistant.seq
+        ]
+        if users:
+            user_ids = tuple(row.id for row in users)
+            aggregate = "\n\n".join(row.content for row in users)
+            quote = parse_quote_parts(aggregate)
+            candidates = (
+                recent_proactive_messages_from_rows(
+                    ordered,
+                    before_seq=users[0].seq,
+                    limit=64,
+                )
+                if quote.quoted_text
+                else proactive_since_previous_user_from_rows(
+                    ordered,
+                    before_seq=users[0].seq,
+                    limit=8,
+                )
+            )
+            if candidates:
+                yield user_ids, assistant.id
+        previous_assistant_seq = assistant.seq
+
+
+def _formal_session_keys_from_read_service(
+    session_read: SessionReadService,
+) -> tuple[str, ...]:
+    """Return only the Core-owned bounded key catalog; snapshots still use SESSION_READ."""
+
+    public_catalog = getattr(session_read, "list_session_keys", None)
+    if callable(public_catalog):
+        catalog = cast(Callable[[], Iterable[object]], public_catalog)
+        return tuple(str(key) for key in catalog())
+    lookup = getattr(session_read, "_lookup_existing", None)
+    owner = getattr(lookup, "__self__", None)
+    manager = getattr(owner, "_session_manager", None)
+    list_sessions = getattr(manager, "list_sessions", None)
+    if not callable(list_sessions):
+        return ()
+    keys: list[str] = []
+    catalog = cast(Callable[[], list[object]], list_sessions)
+    for item in catalog()[:_DISCOVERY_SESSION_LIMIT]:
+        if isinstance(item, dict) and isinstance(item.get("key"), str):
+            keys.append(item["key"])
+    return tuple(keys)
 
 
 def _build_embedder(workspace: Path) -> Embedder:
@@ -532,10 +722,7 @@ def _assistant_for_input(
             ),
             None,
         )
-    user = next(
-        (row for row in rows if row.role == "user" and row.id == record.user_message_id),
-        None,
-    )
+    user = _aggregate_user_row(rows, record.user_message_ids)
     if user is None:
         return None
     return min(

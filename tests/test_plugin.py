@@ -105,6 +105,65 @@ def _snapshot(*, quoted: bool = True) -> SessionReadSnapshot:
     )
 
 
+def _two_user_event() -> TurnCommitted:
+    first = "被回复消息：主动提醒某个很长很长的主题"
+    second = "【你当前新消息】我继续这个主题"
+    return TurnCommitted(
+        session_key="mobile:test",
+        channel="test",
+        chat_id="chat",
+        input_message=f"{first}\n\n{second}",
+        persisted_user_message=f"{first}\n\n{second}",
+        assistant_response="我接着回答这个主题",
+        tools_used=[],
+        persisted_user_message_id="u2",
+        persisted_user_message_ids=("u1", "u2"),
+        assistant_message_id="a1",
+    )
+
+
+def _two_user_snapshot() -> SessionReadSnapshot:
+    return SessionReadSnapshot(
+        session_key="mobile:test",
+        messages=(
+            {
+                "id": "p1",
+                "seq": 1,
+                "role": "assistant",
+                "content": "主动提醒某个很长很长的主题",
+                "extra": '{"proactive": true}',
+                "ts": "2026-08-17T00:00:00+00:00",
+            },
+            {
+                "id": "u1",
+                "seq": 2,
+                "role": "user",
+                "content": "被回复消息：主动提醒某个很长很长的主题",
+                "extra": None,
+                "ts": "2026-08-17T00:00:10+00:00",
+            },
+            {
+                "id": "u2",
+                "seq": 3,
+                "role": "user",
+                "content": "【你当前新消息】我继续这个主题",
+                "extra": None,
+                "ts": "2026-08-17T00:00:11+00:00",
+            },
+            {
+                "id": "a1",
+                "seq": 4,
+                "role": "assistant",
+                "content": "我接着回答这个主题",
+                "extra": None,
+                "ts": "2026-08-17T00:00:12+00:00",
+            },
+        ),
+        compaction_generation=0,
+        consolidated_through_seq=None,
+    )
+
+
 def test_module_exports_pure_v3_contract() -> None:
     assert module.api_version == 3
     assert module.name == "proactive_feedback"
@@ -285,6 +344,103 @@ async def test_durable_input_replays_after_runtime_restart(tmp_path: Path) -> No
         assert conn.execute(
             "SELECT processed_at FROM proactive_feedback_input_inbox"
         ).fetchone()[0] is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_input_keeps_ordered_two_user_ids_and_scores_one_turn(
+    tmp_path: Path,
+) -> None:
+    published: list[ProactiveFeedbackCommitted] = []
+
+    async def publish(event: ProactiveFeedbackCommitted) -> None:
+        published.append(event)
+
+    session_read = SessionReadService(
+        lambda _key: (
+            cast(Any, SimpleNamespace(
+                messages=[dict(message) for message in _two_user_snapshot().messages],
+                last_consolidated=0,
+            )),
+            None,
+        )
+    )
+    original = module.ProactiveFeedbackRuntime(
+        session_read=session_read,
+        workspace=tmp_path,
+        db_path=tmp_path / "data" / "proactive_feedback.db",
+    )
+    original.enqueue(_two_user_event())
+
+    restarted = module.ProactiveFeedbackRuntime(
+        session_read=session_read,
+        workspace=tmp_path,
+        db_path=original._db_path,
+        publish_feedback=publish,
+    )
+    assert await restarted._process_pending_inputs() is False
+
+    conn = sqlite3.connect(original._db_path)
+    try:
+        inbox = conn.execute(
+            "SELECT user_message_id, user_message_ids_json, processed_at "
+            "FROM proactive_feedback_input_inbox"
+        ).fetchone()
+        projection = conn.execute(
+            "SELECT user_message_id, user_content_preview "
+            "FROM proactive_feedback_events"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert inbox == ("u2", '["u1", "u2"]', inbox[2])
+    assert inbox[2] is not None
+    assert projection[0] == "u2"
+    assert "被回复消息" in projection[1] and "当前新消息" in projection[1]
+    assert [event.event_id for event in published] == ["proactive_feedback:1"]
+
+
+@pytest.mark.asyncio
+async def test_formal_boot_discovers_committed_turn_without_callback_once(
+    tmp_path: Path,
+) -> None:
+    published: list[ProactiveFeedbackCommitted] = []
+    published_event = asyncio.Event()
+
+    async def publish(event: ProactiveFeedbackCommitted) -> None:
+        published.append(event)
+        published_event.set()
+
+    session_read = SessionReadService(
+        lambda _key: (
+            cast(Any, _session_state()),
+            None,
+        )
+    )
+    restarted = module.ProactiveFeedbackRuntime(
+        session_read=session_read,
+        workspace=tmp_path,
+        db_path=tmp_path / "data" / "proactive_feedback.db",
+        publish_feedback=publish,
+        session_keys=lambda: ("mobile:test",),
+    )
+
+    worker = asyncio.create_task(restarted.run_worker())
+    await asyncio.wait_for(published_event.wait(), timeout=1)
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+    restarted._discover_committed_inputs()
+
+    assert [event.event_id for event in published] == ["proactive_feedback:1"]
+    conn = sqlite3.connect(restarted._db_path)
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM proactive_feedback_input_inbox"
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT count(*) FROM proactive_feedback_events"
+        ).fetchone() == (1,)
     finally:
         conn.close()
 
