@@ -96,3 +96,27 @@ migration.migrate_v2_data(Path(os.environ['FEEDBACK_TEST_WORKSPACE']), 'github')
     assert source.is_file() and _digest(source) == source_digest
     assert (target / ".proactive-feedback-v2-migration.json").is_file()
     assert not list((workspace / "plugin-data").glob(".proactive-feedback-v2-migrate-*"))
+
+
+def test_completed_receipt_requires_retained_source(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    source = _source(workspace)
+    _ = migration.migrate_v2_data(workspace, "github")
+    source.unlink()
+
+    with pytest.raises(FileNotFoundError, match="不存在或不安全"):
+        _ = migration.migrate_v2_data(workspace, "github")
+
+
+def test_legacy_parent_symlink_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    _ = _source(outside)
+    workspace.mkdir()
+    (workspace / "proactive_feedback").symlink_to(
+        outside / "proactive_feedback",
+        target_is_directory=True,
+    )
+
+    with pytest.raises(FileNotFoundError, match="不存在或不安全"):
+        _ = migration.migrate_v2_data(workspace, "github")

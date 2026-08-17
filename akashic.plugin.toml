@@ -9,5 +9,6 @@ exclude_data_paths = [
   "proactive_feedback.db",
   "proactive_feedback.db-wal",
   "proactive_feedback.db-shm",
+  "proactive_feedback.db-journal",
   ".proactive-feedback-v2-migration.json",
 ]

@@ -64,7 +64,11 @@ def _remove_crash_staging(workspace: Path) -> None:
         shutil.rmtree(path)
 
 
-def _verify_receipt(target: Path, receipt: dict[str, object]) -> dict[str, object]:
+def _verify_receipt(
+    target: Path,
+    source: Path,
+    receipt: dict[str, object],
+) -> dict[str, object]:
     """Verify the durable receipt and its exact published database."""
 
     database = receipt.get("database")
@@ -76,6 +80,9 @@ def _verify_receipt(target: Path, receipt: dict[str, object]) -> dict[str, objec
         or not isinstance(database, dict)
     ):
         raise ValueError("Proactive Feedback migration receipt 身份无效")
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"Proactive Feedback migration 旧源已丢失: {source}")
+    _integrity(source)
     expected = database.get("sha256")
     size = database.get("size")
     path = target / _DATABASE
@@ -112,15 +119,22 @@ def _migrate_locked(workspace: Path, marketplace: str) -> dict[str, object]:
     # 1. Validate all durable paths before opening SQLite.
     if not marketplace or not marketplace.replace("-", "").replace("_", "").isalnum():
         raise ValueError(f"Proactive Feedback marketplace 无效: {marketplace}")
-    source = workspace / "proactive_feedback" / _DATABASE
-    if source.is_symlink() or not source.is_file() or not source.is_relative_to(workspace):
+    legacy_root = workspace / "proactive_feedback"
+    source = legacy_root / _DATABASE
+    if (
+        legacy_root.is_symlink()
+        or not legacy_root.is_dir()
+        or source.is_symlink()
+        or not source.is_file()
+        or not source.resolve().is_relative_to(workspace)
+    ):
         raise FileNotFoundError(f"Proactive Feedback v2 数据库不存在或不安全: {source}")
     target = workspace / "plugin-data" / f"proactive_feedback-{marketplace}"
     validate_workspace_plugin_data_path(target, workspace)
     _remove_crash_staging(workspace)
     existing = _read_receipt(target / _RECEIPT)
     if existing is not None:
-        return _verify_receipt(target, existing)
+        return _verify_receipt(target, source, existing)
 
     # 2. Freeze a consistent source snapshot outside the published target.
     parent = workspace / "plugin-data"
@@ -170,7 +184,7 @@ def _migrate_locked(workspace: Path, marketplace: str) -> dict[str, object]:
             if published:
                 destination.unlink(missing_ok=True)
             raise
-        return _verify_receipt(target, receipt)
+        return _verify_receipt(target, source, receipt)
     except BaseException:
         if target_created and target.is_dir() and not any(target.iterdir()):
             target.rmdir()
