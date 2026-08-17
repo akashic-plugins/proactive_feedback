@@ -19,6 +19,9 @@ class FeedbackEvent:
     candidate_count: int
     matched_by: str
     reason: str
+    user_content_preview: str | None = None
+    assistant_content_preview: str | None = None
+    proactive_content_preview: str | None = None
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -44,6 +47,9 @@ def open_db(path: Path) -> sqlite3.Connection:
             candidate_count INTEGER NOT NULL,
             matched_by TEXT NOT NULL,
             reason TEXT NOT NULL,
+            user_content_preview TEXT,
+            assistant_content_preview TEXT,
+            proactive_content_preview TEXT,
             UNIQUE(user_message_id, proactive_message_id)
         );
 
@@ -58,6 +64,9 @@ def open_db(path: Path) -> sqlite3.Connection:
         WHERE proactive_message_id IS NOT NULL;
         """
     )
+    _ensure_column(conn, "user_content_preview")
+    _ensure_column(conn, "assistant_content_preview")
+    _ensure_column(conn, "proactive_content_preview")
     conn.commit()
     return conn
 
@@ -94,9 +103,12 @@ def insert_feedback(conn: sqlite3.Connection, event: FeedbackEvent) -> int | Non
             lag_seconds,
             candidate_count,
             matched_by,
-            reason
+            reason,
+            user_content_preview,
+            assistant_content_preview,
+            proactive_content_preview
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             event.session_key,
@@ -111,6 +123,9 @@ def insert_feedback(conn: sqlite3.Connection, event: FeedbackEvent) -> int | Non
             event.candidate_count,
             event.matched_by,
             event.reason,
+            event.user_content_preview,
+            event.assistant_content_preview,
+            event.proactive_content_preview,
         ),
     )
     conn.commit()
@@ -118,3 +133,14 @@ def insert_feedback(conn: sqlite3.Connection, event: FeedbackEvent) -> int | Non
     if row_id is None:
         raise RuntimeError("feedback insert failed")
     return int(row_id)
+
+
+def _ensure_column(conn: sqlite3.Connection, name: str) -> None:
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(proactive_feedback_events)")
+    }
+    if name not in columns:
+        _ = conn.execute(
+            f"ALTER TABLE proactive_feedback_events ADD COLUMN {name} TEXT"
+        )

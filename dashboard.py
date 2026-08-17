@@ -3,16 +3,26 @@ from __future__ import annotations
 from contextlib import contextmanager
 import sqlite3
 import threading
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
+from agent.plugin_composition import DashboardContext
 from fastapi import FastAPI
 
 
+_PREVIEW_COLUMNS = (
+    "user_content_preview",
+    "assistant_content_preview",
+    "proactive_content_preview",
+)
+
+
 class ProactiveFeedbackDashboardReader:
-    def __init__(self, workspace: Path) -> None:
-        self.db_path = workspace / "proactive_feedback" / "proactive_feedback.db"
-        self.sessions_db_path = workspace / "sessions.db"
+    """Read the plugin-owned feedback projection without opening Core databases."""
+
+    def __init__(self, data_root: Path) -> None:
+        self.db_path = data_root / "proactive_feedback.db"
         self._lock = threading.RLock()
 
     def get_overview(self) -> dict[str, Any]:
@@ -103,7 +113,8 @@ class ProactiveFeedbackDashboardReader:
                         lag_seconds,
                         candidate_count,
                         matched_by,
-                        reason
+                        reason,
+                        {_preview_select(db)}
                     FROM proactive_feedback_events
                     {where}
                     ORDER BY created_at DESC, id DESC
@@ -111,8 +122,7 @@ class ProactiveFeedbackDashboardReader:
                     """,
                     (*params, safe_size, offset),
                 ).fetchall()
-            previews = self._load_previews(rows)
-        return [_event_row(row, previews, preview_limit=360) for row in rows], total
+        return [_event_row(row, preview_limit=360) for row in rows], total
 
     def get_event(self, event_id: int) -> dict[str, Any] | None:
         if not self.db_path.exists():
@@ -127,42 +137,13 @@ class ProactiveFeedbackDashboardReader:
                     """,
                     (event_id,),
                 ).fetchone()
-            if row is None:
-                return None
-            previews = self._load_previews([row])
-        return _event_row(row, previews, preview_limit=2400)
-
-    def _load_previews(self, rows: list[sqlite3.Row]) -> dict[str, str]:
-        ids: list[str] = []
-        for row in rows:
-            ids.extend(
-                str(value)
-                for value in (
-                    row["user_message_id"],
-                    row["assistant_message_id"],
-                    row["proactive_message_id"],
-                )
-                if value
-            )
-        if not ids or not self.sessions_db_path.exists():
-            return {}
-        unique_ids = list(dict.fromkeys(ids))
-        placeholders = ",".join("?" for _ in unique_ids)
-        with _connect(self.sessions_db_path) as db:
-            msg_rows = db.execute(
-                f"""
-                SELECT id, content
-                FROM messages
-                WHERE id IN ({placeholders})
-                """,
-                unique_ids,
-            ).fetchall()
-        return {str(row["id"]): str(row["content"] or "") for row in msg_rows}
+        return None if row is None else _event_row(row, preview_limit=2400)
 
 
-def register(app: FastAPI, plugin_dir: Path, workspace: Path) -> None:
-    _ = plugin_dir
-    reader = ProactiveFeedbackDashboardReader(workspace)
+def register(app: FastAPI, context: DashboardContext) -> None:
+    """Register dashboard routes against the exact generation data root."""
+
+    reader = ProactiveFeedbackDashboardReader(context.data_root)
 
     @app.get("/api/dashboard/proactive-feedback/overview")
     def get_proactive_feedback_overview() -> dict[str, Any]:
@@ -205,6 +186,17 @@ def _empty_overview() -> dict[str, Any]:
     }
 
 
+def _preview_select(db: sqlite3.Connection) -> str:
+    columns = {
+        str(row[1])
+        for row in db.execute("PRAGMA table_info(proactive_feedback_events)")
+    }
+    return ", ".join(
+        column if column in columns else f"NULL AS {column}"
+        for column in _PREVIEW_COLUMNS
+    )
+
+
 def _group_rows(db: sqlite3.Connection, column: str) -> list[dict[str, Any]]:
     rows = db.execute(
         f"""
@@ -226,23 +218,15 @@ def _scalar_int(
     return int(row[0] or 0) if row is not None else 0
 
 
-def _event_row(
-    row: sqlite3.Row,
-    previews: dict[str, str],
-    *,
-    preview_limit: int = 120,
-) -> dict[str, Any]:
-    user_id = str(row["user_message_id"])
-    assistant_id = str(row["assistant_message_id"])
-    proactive_id = str(row["proactive_message_id"] or "")
-    user_text = previews.get(user_id)
+def _event_row(row: sqlite3.Row, *, preview_limit: int = 120) -> dict[str, Any]:
+    user_text = _row_text(row, "user_content_preview")
     return {
         "id": int(row["id"]),
         "created_at": row["created_at"],
         "session_key": row["session_key"],
-        "user_message_id": user_id,
-        "assistant_message_id": assistant_id,
-        "proactive_message_id": proactive_id,
+        "user_message_id": str(row["user_message_id"]),
+        "assistant_message_id": str(row["assistant_message_id"]),
+        "proactive_message_id": str(row["proactive_message_id"] or ""),
         "feedback_type": row["feedback_type"],
         "confidence": row["confidence"],
         "pa_score": row["pa_score"],
@@ -254,9 +238,22 @@ def _event_row(
         "user_preview": _preview(user_text, preview_limit),
         "user_reply_preview": _preview(_current_reply(user_text), preview_limit),
         "quoted_preview": _preview(_quoted_reply(user_text), preview_limit),
-        "assistant_preview": _preview(previews.get(assistant_id), preview_limit),
-        "proactive_preview": _preview(previews.get(proactive_id), preview_limit),
+        "assistant_preview": _preview(
+            _row_text(row, "assistant_content_preview"),
+            preview_limit,
+        ),
+        "proactive_preview": _preview(
+            _row_text(row, "proactive_content_preview"),
+            preview_limit,
+        ),
     }
+
+
+def _row_text(row: sqlite3.Row, name: str) -> str | None:
+    if name not in row.keys():
+        return None
+    value = row[name]
+    return None if value is None else str(value)
 
 
 def _preview(value: str | None, limit: int) -> str:
