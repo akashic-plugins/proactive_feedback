@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any, cast
 
 from agent.config_models import Config as CoreConfig
 from agent.plugin_composition import (
@@ -15,11 +19,22 @@ from agent.plugin_composition import (
     UI_SLOTS,
 )
 from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
+from agent.turn_events.proactive_feedback import (
+    PROACTIVE_FEEDBACK_COMMITTED,
+    ProactiveFeedbackCommitted,
+)
 from bus.events_lifecycle import TurnCommitted
+from core.net.http import get_default_http_requester
 from memory2.embedder import Embedder
 
 from .dashboard import ProactiveFeedbackDashboardReader
-from .db import FeedbackEvent, insert_feedback, open_db
+from .db import (
+    FeedbackEvent,
+    insert_feedback,
+    mark_feedback_published,
+    open_db,
+    pending_feedback_outbox,
+)
 from .scorer import (
     latest_turn_messages_from_rows,
     message_rows_from_snapshot,
@@ -35,6 +50,10 @@ logger = logging.getLogger("plugin.proactive_feedback")
 _QUEUE_MAX = 100
 _FEEDBACK_DB_NAME = "proactive_feedback.db"
 _PREVIEW_MAX_CHARS = 2400
+_OUTBOX_BATCH_SIZE = 100
+_OUTBOX_RETRY_SECONDS = 1.0
+
+FeedbackPublisher = Callable[[ProactiveFeedbackCommitted], Awaitable[None]]
 
 api_version = 3
 name = "proactive_feedback"
@@ -60,6 +79,10 @@ async def apply(ctx: Context, config: object) -> None:
         session_read=session_read,
         workspace=ctx.runtime.workspace,
         db_path=db_path,
+        publish_feedback=lambda event: ctx.observe(
+            PROACTIVE_FEEDBACK_COMMITTED,
+            event,
+        ),
     )
 
     # 2. Bind every executable contribution to this Fiber's lifecycle.
@@ -88,10 +111,12 @@ class ProactiveFeedbackRuntime:
         session_read: SessionReadService,
         workspace: Path,
         db_path: Path,
+        publish_feedback: FeedbackPublisher | None = None,
     ) -> None:
         self._session_read = session_read
         self._workspace = workspace
         self._db_path = db_path
+        self._publish_feedback = publish_feedback
         self._queue: asyncio.Queue[TurnCommitted] = asyncio.Queue(maxsize=_QUEUE_MAX)
         self._embedder: Embedder | None = None
 
@@ -112,9 +137,22 @@ class ProactiveFeedbackRuntime:
         """Process queued committed turns until the owning Fiber is disposed."""
 
         while True:
+            # 1. Replay every durable payload before waiting for new Turns.
+            try:
+                await self._publish_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("proactive_feedback outbox publish failed")
+                await asyncio.sleep(_OUTBOX_RETRY_SECONDS)
+                continue
+
+            # 2. Process one Core-committed Turn and drain its transaction's outbox.
             event = await self._queue.get()
             try:
                 await self._process(event)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("proactive_feedback process failed")
             finally:
@@ -229,6 +267,7 @@ class ProactiveFeedbackRuntime:
                 matched_by="recent_pua",
                 reason="scoring_failed",
             )
+            await self._publish_pending()
             return
         if scored is None:
             return
@@ -246,6 +285,7 @@ class ProactiveFeedbackRuntime:
             matched_by=scored.matched_by,
             reason=scored.reason,
         )
+        await self._publish_pending()
 
     async def _persist_feedback(
         self,
@@ -288,6 +328,37 @@ class ProactiveFeedbackRuntime:
         finally:
             sink.close()
 
+    async def _publish_pending(self) -> None:
+        """Publish durable rows and advance their SQLite cursor after receipt."""
+
+        # 1. A candidate with no database and tests without a publisher stay inert.
+        if self._publish_feedback is None or not self._db_path.exists():
+            return
+        # 2. Publish outside SQLite; only a returned receipt advances state.
+        while True:
+            sink = open_db(self._db_path)
+            try:
+                pending = pending_feedback_outbox(sink, limit=_OUTBOX_BATCH_SIZE)
+            finally:
+                sink.close()
+            if not pending:
+                return
+            for record in pending:
+                payload = _decode_outbox_payload(record.payload_json)
+                if payload.get("event_id") != record.event_id:
+                    raise ValueError("proactive_feedback outbox event_id 不一致")
+                feedback = ProactiveFeedbackCommitted(**cast(Any, payload))
+                await self._publish_feedback(feedback)
+                sink = open_db(self._db_path)
+                try:
+                    mark_feedback_published(
+                        sink,
+                        row_id=record.row_id,
+                        event_id=record.event_id,
+                    )
+                finally:
+                    sink.close()
+
     def _get_embedder(self) -> Embedder:
         if self._embedder is None:
             self._embedder = _build_embedder(self._workspace)
@@ -299,13 +370,26 @@ def _bounded_preview(value: str, limit: int = _PREVIEW_MAX_CHARS) -> str:
 
 
 def _build_embedder(workspace: Path) -> Embedder:
-    embedding = CoreConfig.load(workspace=workspace).memory.embedding
+    config_path = os.environ.get("AKASHIC_CONFIG", "").strip()
+    if not config_path:
+        raise RuntimeError("proactive_feedback 需要 Core 的 AKASHIC_CONFIG")
+    embedding = CoreConfig.load(path=config_path, workspace=workspace).memory.embedding
     return Embedder(
         base_url=embedding.base_url,
         api_key=embedding.api_key,
         model=embedding.model,
         output_dimensionality=embedding.output_dimensionality,
+        requester=get_default_http_requester("external_default"),
     )
+
+
+def _decode_outbox_payload(payload_json: str) -> dict[str, object]:
+    """Decode one durable payload without accepting a second fallback schema."""
+
+    payload = json.loads(payload_json)
+    if not isinstance(payload, dict):
+        raise TypeError("proactive_feedback outbox payload 必须是 object")
+    return payload
 
 
 async def _no_embed(texts: list[str]) -> list[list[float]]:
