@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -530,34 +530,49 @@ class ProactiveFeedbackRuntime:
         if not ordered_keys:
             return
 
-        # 3. Read detached snapshots and persist identities only.
+        # 3. Read detached snapshots and retain one ordered stream per session.
         sink = open_db(self._db_path)
         try:
-            discovered = 0
+            turn_streams: list[
+                tuple[str, Iterator[tuple[tuple[str, ...], str]]]
+            ] = []
             for session_key in ordered_keys:
                 snapshot = self._session_read.read(session_key)
                 if snapshot is None:
                     continue
                 rows = message_rows_from_snapshot(snapshot.messages)
-                for user_ids, assistant_id in _iter_discovered_turns(rows):
-                    if discovered >= _DISCOVERY_TURN_LIMIT:
+                turn_streams.append((session_key, iter(_iter_discovered_turns(rows))))
+
+            # 4. Rotate sessions so one history cannot consume the whole boot budget.
+            examined = 0
+            while turn_streams and examined < _DISCOVERY_TURN_LIMIT:
+                next_streams: list[
+                    tuple[str, Iterator[tuple[tuple[str, ...], str]]]
+                ] = []
+                for session_key, turns in turn_streams:
+                    if examined >= _DISCOVERY_TURN_LIMIT:
                         return
-                    if feedback_identity_exists(
+                    try:
+                        user_ids, assistant_id = next(turns)
+                    except StopIteration:
+                        continue
+                    examined += 1
+                    if not feedback_identity_exists(
                         sink,
                         session_key=session_key,
                         user_message_id=user_ids[-1],
                     ):
-                        continue
-                    _ = insert_feedback_input(
-                        sink,
-                        session_key=session_key,
-                        turn_id="",
-                        client_message_id="",
-                        user_message_id=user_ids[-1],
-                        user_message_ids=user_ids,
-                        assistant_message_id=assistant_id,
-                    )
-                    discovered += 1
+                        _ = insert_feedback_input(
+                            sink,
+                            session_key=session_key,
+                            turn_id="",
+                            client_message_id="",
+                            user_message_id=user_ids[-1],
+                            user_message_ids=user_ids,
+                            assistant_message_id=assistant_id,
+                        )
+                    next_streams.append((session_key, turns))
+                turn_streams = next_streams
         finally:
             sink.close()
 

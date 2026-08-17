@@ -164,6 +164,42 @@ def _two_user_snapshot() -> SessionReadSnapshot:
     )
 
 
+def _multi_turn_session_state(session_key: str, *, count: int = 5) -> object:
+    messages: list[dict[str, object]] = []
+    seq = 1
+    for index in range(count):
+        messages.extend(
+            [
+                {
+                    "id": f"{session_key}:p{index}",
+                    "seq": seq,
+                    "role": "assistant",
+                    "content": f"主动提醒 {index}",
+                    "extra": '{"proactive": true}',
+                    "ts": "2026-08-17T00:00:00+00:00",
+                },
+                {
+                    "id": f"{session_key}:u{index}",
+                    "seq": seq + 1,
+                    "role": "user",
+                    "content": f"继续主题 {index}",
+                    "extra": None,
+                    "ts": "2026-08-17T00:00:01+00:00",
+                },
+                {
+                    "id": f"{session_key}:a{index}",
+                    "seq": seq + 2,
+                    "role": "assistant",
+                    "content": f"回答主题 {index}",
+                    "extra": None,
+                    "ts": "2026-08-17T00:00:02+00:00",
+                },
+            ]
+        )
+        seq += 3
+    return SimpleNamespace(messages=messages, last_consolidated=0)
+
+
 def test_module_exports_pure_v3_contract() -> None:
     assert module.api_version == 3
     assert module.name == "proactive_feedback"
@@ -499,6 +535,69 @@ def test_formal_boot_prioritizes_new_session_over_old_catalog_window(
     assert len(read_keys) == 64
     conn = sqlite3.connect(db_path)
     try:
+        assert conn.execute(
+            "SELECT count(*) FROM proactive_feedback_input_inbox "
+            "WHERE session_key = ?",
+            (new_key,),
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+def test_formal_boot_rotates_turns_across_sessions_with_pending_history(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    old_keys = tuple(f"old:{index:02d}" for index in range(64))
+    new_key = "mobile:new"
+    read_keys: list[str] = []
+
+    def lookup(session_key: str) -> tuple[Any, None]:
+        read_keys.append(session_key)
+        count = 1 if session_key == new_key else 5
+        return cast(Any, _multi_turn_session_state(session_key, count=count)), None
+
+    db_path = tmp_path / "data" / "proactive_feedback.db"
+    sink = module.open_db(db_path)
+    try:
+        for session_key in old_keys:
+            for index in range(5):
+                module.insert_feedback_input(
+                    sink,
+                    session_key=session_key,
+                    turn_id="",
+                    client_message_id="",
+                    user_message_id=f"{session_key}:u{index}",
+                    assistant_message_id=f"{session_key}:a{index}",
+                )
+    finally:
+        sink.close()
+
+    insert_calls = 0
+    real_insert = module.insert_feedback_input
+
+    def track_insert(*args: Any, **kwargs: Any) -> int:
+        nonlocal insert_calls
+        insert_calls += 1
+        return real_insert(*args, **kwargs)
+
+    monkeypatch.setattr(module, "insert_feedback_input", track_insert)
+    runtime = module.ProactiveFeedbackRuntime(
+        session_read=SessionReadService(lookup),
+        workspace=tmp_path,
+        db_path=db_path,
+        session_keys=lambda: (*old_keys, new_key),
+    )
+    runtime._discover_committed_inputs()
+
+    assert new_key in read_keys
+    assert len(read_keys) == 64
+    assert insert_calls <= module._DISCOVERY_TURN_LIMIT
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM proactive_feedback_input_inbox"
+        ).fetchone() == (len(old_keys) * 5 + 1,)
         assert conn.execute(
             "SELECT count(*) FROM proactive_feedback_input_inbox "
             "WHERE session_key = ?",
