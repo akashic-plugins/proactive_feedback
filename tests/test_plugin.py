@@ -288,7 +288,9 @@ async def test_feedback_commit_publishes_typed_event_and_cursor(tmp_path: Path) 
 
 def test_committed_turn_identity_is_durable_without_message_text(tmp_path: Path) -> None:
     runtime = module.ProactiveFeedbackRuntime(
-        session_read=SessionReadService.candidate_validation(),
+        session_read=SessionReadService(
+            lambda _key: (cast(Any, _session_state()), None)
+        ),
         workspace=tmp_path,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
@@ -312,6 +314,20 @@ def test_committed_turn_identity_is_durable_without_message_text(tmp_path: Path)
     assert row == ("mobile:test", "u1", "a1", "", "", None)
     assert "user_content" not in columns
     assert "assistant_content" not in columns
+
+
+def test_candidate_enqueue_fails_before_any_write(tmp_path: Path) -> None:
+    db_path = tmp_path / "data" / "proactive_feedback.db"
+    runtime = module.ProactiveFeedbackRuntime(
+        session_read=SessionReadService.candidate_validation(),
+        workspace=tmp_path,
+        db_path=db_path,
+    )
+
+    with pytest.raises(RuntimeError, match="候选验证期禁止写入"):
+        runtime.enqueue(_event())
+
+    assert not db_path.exists()
 
 
 @pytest.mark.asyncio
@@ -440,6 +456,53 @@ async def test_formal_boot_discovers_committed_turn_without_callback_once(
         ).fetchone() == (1,)
         assert conn.execute(
             "SELECT count(*) FROM proactive_feedback_events"
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
+
+
+def test_formal_boot_prioritizes_new_session_over_old_catalog_window(
+    tmp_path: Path,
+) -> None:
+    old_keys = tuple(f"old:{index:02d}" for index in range(64))
+    new_key = "mobile:new"
+    read_keys: list[str] = []
+
+    def lookup(session_key: str) -> tuple[Any, None]:
+        read_keys.append(session_key)
+        return cast(Any, _session_state()), None
+
+    db_path = tmp_path / "data" / "proactive_feedback.db"
+    sink = module.open_db(db_path)
+    try:
+        for index, session_key in enumerate(old_keys):
+            module.insert_feedback_input(
+                sink,
+                session_key=session_key,
+                turn_id="",
+                client_message_id="",
+                user_message_id=f"old-u{index}",
+                assistant_message_id="old-a",
+            )
+    finally:
+        sink.close()
+
+    runtime = module.ProactiveFeedbackRuntime(
+        session_read=SessionReadService(lookup),
+        workspace=tmp_path,
+        db_path=db_path,
+        session_keys=lambda: (*old_keys, new_key),
+    )
+    runtime._discover_committed_inputs()
+
+    assert new_key in read_keys
+    assert len(read_keys) == 64
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM proactive_feedback_input_inbox "
+            "WHERE session_key = ?",
+            (new_key,),
         ).fetchone() == (1,)
     finally:
         conn.close()

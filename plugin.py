@@ -136,8 +136,13 @@ class ProactiveFeedbackRuntime:
     def enqueue(self, event: TurnCommitted) -> None:
         """Durably record one committed Turn identity and wake the worker."""
 
+        # 1. Candidate validation has no formal Session or plugin data owner.
+        if getattr(self._session_read, "_lookup_existing", None) is None:
+            raise RuntimeError("候选验证期禁止写入 proactive_feedback")
         if event.persisted_user_message is None or not _event_user_message_ids(event):
             return
+
+        # 2. Persist the identity before waking the in-memory worker.
         input_row_id = self._persist_input(event)
         try:
             self._queue.put_nowait(input_row_id)
@@ -498,20 +503,30 @@ class ProactiveFeedbackRuntime:
         if getattr(self._session_read, "_lookup_existing", None) is None:
             return
 
-        # 2. Combine the durable catalog with Core's bounded existing-session list.
-        keys: list[str] = []
+        # 2. Prefer Core's current key catalog; the durable catalog only fills gaps.
+        ordered_keys = list(
+            _bounded_session_keys(
+                self._session_keys(),
+                limit=_DISCOVERY_SESSION_LIMIT,
+            )
+        )
         if self._db_path.exists():
             sink = open_db(self._db_path)
             try:
-                keys.extend(
-                    feedback_session_keys(sink, limit=_DISCOVERY_SESSION_LIMIT)
+                catalog_keys = feedback_session_keys(
+                    sink,
+                    limit=_DISCOVERY_SESSION_LIMIT,
                 )
             finally:
                 sink.close()
-        keys.extend(self._session_keys())
-        ordered_keys = tuple(dict.fromkeys(key for key in keys if key))[
-            :_DISCOVERY_SESSION_LIMIT
-        ]
+            seen = set(ordered_keys)
+            for session_key in catalog_keys:
+                if len(ordered_keys) >= _DISCOVERY_SESSION_LIMIT:
+                    break
+                if session_key in seen:
+                    continue
+                ordered_keys.append(session_key)
+                seen.add(session_key)
         if not ordered_keys:
             return
 
@@ -671,19 +686,32 @@ def _formal_session_keys_from_read_service(
     public_catalog = getattr(session_read, "list_session_keys", None)
     if callable(public_catalog):
         catalog = cast(Callable[[], Iterable[object]], public_catalog)
-        return tuple(str(key) for key in catalog())
+        return _bounded_session_keys(catalog(), limit=_DISCOVERY_SESSION_LIMIT)
     lookup = getattr(session_read, "_lookup_existing", None)
     owner = getattr(lookup, "__self__", None)
     manager = getattr(owner, "_session_manager", None)
     list_sessions = getattr(manager, "list_sessions", None)
     if not callable(list_sessions):
         return ()
-    keys: list[str] = []
     catalog = cast(Callable[[], list[object]], list_sessions)
-    for item in catalog()[:_DISCOVERY_SESSION_LIMIT]:
+    keys: list[str] = []
+    for item in catalog():
         if isinstance(item, dict) and isinstance(item.get("key"), str):
             keys.append(item["key"])
-    return tuple(keys)
+    return _bounded_session_keys(keys, limit=_DISCOVERY_SESSION_LIMIT)
+
+
+def _bounded_session_keys(
+    values: Iterable[object],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Bound a key catalog while preserving both current-list edges."""
+
+    unique = tuple(dict.fromkeys(str(value) for value in values if value))
+    if len(unique) <= limit:
+        return unique
+    return (*unique[: limit - 1], unique[-1])
 
 
 def _build_embedder(workspace: Path) -> Embedder:
