@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import importlib.util
 import inspect
+import json
 import shutil
 import sqlite3
 import sys
@@ -224,6 +225,178 @@ async def test_feedback_commit_publishes_typed_event_and_cursor(tmp_path: Path) 
         conn.close()
     assert outbox is not None and outbox[0] is not None
     assert cursor == (1,)
+
+
+def test_committed_turn_identity_is_durable_without_message_text(tmp_path: Path) -> None:
+    runtime = module.ProactiveFeedbackRuntime(
+        session_read=SessionReadService.candidate_validation(),
+        workspace=tmp_path,
+        db_path=tmp_path / "data" / "proactive_feedback.db",
+    )
+    runtime.enqueue(_event())
+
+    conn = sqlite3.connect(runtime._db_path)
+    try:
+        row = conn.execute(
+            "SELECT session_key, user_message_id, assistant_message_id, "
+            "turn_id, client_message_id, processed_at "
+            "FROM proactive_feedback_input_inbox"
+        ).fetchone()
+        columns = {
+            str(column[1])
+            for column in conn.execute(
+                "PRAGMA table_info(proactive_feedback_input_inbox)"
+            )
+        }
+    finally:
+        conn.close()
+    assert row == ("mobile:test", "u1", "a1", "", "", None)
+    assert "user_content" not in columns
+    assert "assistant_content" not in columns
+
+
+@pytest.mark.asyncio
+async def test_durable_input_replays_after_runtime_restart(tmp_path: Path) -> None:
+    published: list[ProactiveFeedbackCommitted] = []
+
+    async def publish(event: ProactiveFeedbackCommitted) -> None:
+        published.append(event)
+
+    original = module.ProactiveFeedbackRuntime(
+        session_read=SessionReadService(
+            lambda _key: (cast(Any, _session_state()), None)
+        ),
+        workspace=tmp_path,
+        db_path=tmp_path / "data" / "proactive_feedback.db",
+    )
+    original.enqueue(_event())
+
+    restarted = module.ProactiveFeedbackRuntime(
+        session_read=original._session_read,
+        workspace=tmp_path,
+        db_path=original._db_path,
+        publish_feedback=publish,
+    )
+    assert await restarted._process_pending_inputs() is False
+    assert [event.event_id for event in published] == ["proactive_feedback:1"]
+
+    conn = sqlite3.connect(original._db_path)
+    try:
+        assert conn.execute(
+            "SELECT processed_at FROM proactive_feedback_input_inbox"
+        ).fetchone()[0] is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_input_cancellation_keeps_pending_row(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+
+    async def blocked_scoring(**_kwargs: object) -> None:
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(module, "score_followup", blocked_scoring)
+    runtime = module.ProactiveFeedbackRuntime(
+        session_read=SessionReadService(
+            lambda _key: (cast(Any, _session_state()), None)
+        ),
+        workspace=tmp_path,
+        db_path=tmp_path / "data" / "proactive_feedback.db",
+    )
+    runtime.enqueue(_event())
+    task = asyncio.create_task(runtime._process_pending_inputs())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    conn = sqlite3.connect(runtime._db_path)
+    try:
+        assert conn.execute(
+            "SELECT processed_at FROM proactive_feedback_input_inbox"
+        ).fetchone() == (None,)
+    finally:
+        conn.close()
+
+
+def test_published_feedback_identity_is_immutable(tmp_path: Path) -> None:
+    sink = module.open_db(tmp_path / "proactive_feedback.db")
+    try:
+        first = FeedbackEvent(
+            session_key="mobile:test",
+            user_message_id="u1",
+            assistant_message_id="a1",
+            proactive_message_id="p1",
+            feedback_type="explicit_quote",
+            confidence="gold",
+            pa_score=1.0,
+            pua_score=0.9,
+            lag_seconds=8,
+            candidate_count=1,
+            matched_by="explicit_quote",
+            reason="first_reason",
+            user_content_preview="first user",
+            assistant_content_preview="first answer",
+            proactive_content_preview="first proactive",
+        )
+        row_id = module.insert_feedback(sink, first)
+        assert row_id == 1
+        module.mark_feedback_published(
+            sink,
+            row_id=row_id,
+            event_id="proactive_feedback:1",
+        )
+        second = FeedbackEvent(
+            **{
+                **first.__dict__,
+                "feedback_type": "no_topic_follow",
+                "confidence": "low",
+                "pa_score": 0.1,
+                "pua_score": 0.2,
+                "reason": "second_reason",
+                "user_content_preview": "second user",
+                "assistant_content_preview": "second answer",
+                "proactive_content_preview": "second proactive",
+            }
+        )
+        assert module.insert_feedback(sink, second) == row_id
+        third = FeedbackEvent(
+            **{**first.__dict__, "proactive_message_id": "p2"}
+        )
+        assert module.insert_feedback(sink, third) == 2
+        assert tuple(sink.execute(
+            "SELECT count(*) FROM proactive_feedback_events"
+        ).fetchone()) == (2,)
+        projection = tuple(sink.execute(
+            "SELECT feedback_type, confidence, pa_score, pua_score, reason, "
+            "user_content_preview, assistant_content_preview, proactive_content_preview "
+            "FROM proactive_feedback_events WHERE id = 1"
+        ).fetchone())
+        payload = json.loads(
+            sink.execute(
+                "SELECT payload_json FROM proactive_feedback_outbox "
+                "WHERE row_id = 1"
+            ).fetchone()[0]
+        )
+    finally:
+        sink.close()
+    assert projection == (
+        "explicit_quote",
+        "gold",
+        1.0,
+        0.9,
+        "first_reason",
+        "first user",
+        "first answer",
+        "first proactive",
+    )
+    assert payload["reason"] == "first_reason"
+    assert payload["pa_score"] == 1.0
 
 
 @pytest.mark.asyncio

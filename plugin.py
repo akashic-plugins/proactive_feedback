@@ -30,15 +30,20 @@ from memory2.embedder import Embedder
 from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
     FeedbackEvent,
+    FeedbackInputRecord,
     insert_feedback,
+    insert_feedback_input,
+    mark_feedback_input_processed,
     mark_feedback_published,
     open_db,
+    pending_feedback_input,
+    pending_feedback_inputs,
     pending_feedback_outbox,
 )
 from .scorer import (
+    MessageRow,
     latest_turn_messages_from_rows,
     message_rows_from_snapshot,
-    MessageRow,
     parse_quote_parts,
     proactive_since_previous_user_from_rows,
     recent_proactive_messages_from_rows,
@@ -117,19 +122,23 @@ class ProactiveFeedbackRuntime:
         self._workspace = workspace
         self._db_path = db_path
         self._publish_feedback = publish_feedback
-        self._queue: asyncio.Queue[TurnCommitted] = asyncio.Queue(maxsize=_QUEUE_MAX)
+        self._queue: asyncio.Queue[int] = asyncio.Queue(maxsize=_QUEUE_MAX)
         self._embedder: Embedder | None = None
 
     def enqueue(self, event: TurnCommitted) -> None:
-        """Queue one committed turn without blocking the Core lifecycle seam."""
+        """Durably record one committed Turn identity and wake the worker."""
 
-        if event.persisted_user_message is None:
+        if (
+            event.persisted_user_message is None
+            or event.persisted_user_message_id is None
+        ):
             return
+        input_row_id = self._persist_input(event)
         try:
-            self._queue.put_nowait(event)
+            self._queue.put_nowait(input_row_id)
         except asyncio.QueueFull:
             logger.warning(
-                "proactive_feedback queue full, drop session=%s",
+                "proactive_feedback queue full, durable input retained session=%s",
                 event.session_key,
             )
 
@@ -146,11 +155,22 @@ class ProactiveFeedbackRuntime:
                 logger.exception("proactive_feedback outbox publish failed")
                 await asyncio.sleep(_OUTBOX_RETRY_SECONDS)
                 continue
+            try:
+                has_pending_inputs = await self._process_pending_inputs()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("proactive_feedback durable input replay failed")
+                await asyncio.sleep(_OUTBOX_RETRY_SECONDS)
+                continue
+            if has_pending_inputs:
+                await asyncio.sleep(_OUTBOX_RETRY_SECONDS)
+                continue
 
             # 2. Process one Core-committed Turn and drain its transaction's outbox.
-            event = await self._queue.get()
+            input_row_id = await self._queue.get()
             try:
-                await self._process(event)
+                await self._process_input_row(input_row_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -198,12 +218,18 @@ class ProactiveFeedbackRuntime:
             "page_size": page_size,
         }
 
-    async def _process(self, event: TurnCommitted) -> None:
+    async def _process(
+        self,
+        event: TurnCommitted,
+        *,
+        input_row_id: int | None = None,
+    ) -> None:
         """Score one committed turn using a detached Session snapshot."""
 
         # 1. Resolve the committed message identity through Core's read service.
         user_text = event.persisted_user_message
         if not user_text or not event.assistant_response:
+            self._complete_input(input_row_id)
             return
         snapshot = self._session_read.read(event.session_key)
         if snapshot is None:
@@ -240,6 +266,7 @@ class ProactiveFeedbackRuntime:
                 limit=8,
             )
         if not candidates:
+            self._complete_input(input_row_id)
             return
 
         # 3. Persist one deduplicated projection, including bounded display text.
@@ -267,9 +294,11 @@ class ProactiveFeedbackRuntime:
                 matched_by="recent_pua",
                 reason="scoring_failed",
             )
+            self._complete_input(input_row_id)
             await self._publish_pending()
             return
         if scored is None:
+            self._complete_input(input_row_id)
             return
         await self._persist_feedback(
             event=event,
@@ -285,6 +314,7 @@ class ProactiveFeedbackRuntime:
             matched_by=scored.matched_by,
             reason=scored.reason,
         )
+        self._complete_input(input_row_id)
         await self._publish_pending()
 
     async def _persist_feedback(
@@ -327,6 +357,103 @@ class ProactiveFeedbackRuntime:
             )
         finally:
             sink.close()
+
+    def _persist_input(self, event: TurnCommitted) -> int:
+        sink = open_db(self._db_path)
+        try:
+            return insert_feedback_input(
+                sink,
+                session_key=event.session_key,
+                turn_id=event.turn_id,
+                client_message_id=event.client_message_id,
+                user_message_id=event.persisted_user_message_id or "",
+                assistant_message_id=event.assistant_message_id,
+            )
+        finally:
+            sink.close()
+
+    def _complete_input(self, input_row_id: int | None) -> None:
+        if input_row_id is None:
+            return
+        sink = open_db(self._db_path)
+        try:
+            mark_feedback_input_processed(sink, row_id=input_row_id)
+        finally:
+            sink.close()
+
+    async def _process_pending_inputs(self) -> bool:
+        """Replay durable Turn identities and report unresolved rows."""
+
+        # 1. Read only identities; canonical SessionRead reconstructs text in memory.
+        if not self._db_path.exists():
+            return False
+        sink = open_db(self._db_path)
+        try:
+            pending = pending_feedback_inputs(sink, limit=_OUTBOX_BATCH_SIZE)
+        finally:
+            sink.close()
+        for record in pending:
+            await self._process_input_record(record)
+
+        # 2. Keep retrying rows whose canonical messages are not readable yet.
+        sink = open_db(self._db_path)
+        try:
+            return bool(pending_feedback_inputs(sink, limit=1))
+        finally:
+            sink.close()
+
+    async def _process_input_row(self, input_row_id: int) -> None:
+        if not self._db_path.exists():
+            return
+        sink = open_db(self._db_path)
+        try:
+            record = pending_feedback_input(sink, row_id=input_row_id)
+        finally:
+            sink.close()
+        if record is not None:
+            await self._process_input_record(record)
+
+    async def _process_input_record(self, record: FeedbackInputRecord) -> None:
+        snapshot = self._session_read.read(record.session_key)
+        if snapshot is None:
+            logger.warning(
+                "proactive_feedback durable input session missing session=%s",
+                record.session_key,
+            )
+            return
+        rows = message_rows_from_snapshot(snapshot.messages)
+        user = next(
+            (
+                row
+                for row in rows
+                if row.role == "user" and row.id == record.user_message_id
+            ),
+            None,
+        )
+        assistant = _assistant_for_input(rows, record)
+        if user is None or assistant is None:
+            logger.warning(
+                "proactive_feedback durable input message missing session=%s user=%s",
+                record.session_key,
+                record.user_message_id,
+            )
+            return
+        await self._process(
+            TurnCommitted(
+                session_key=record.session_key,
+                channel="proactive_feedback_replay",
+                chat_id="",
+                input_message=user.content,
+                persisted_user_message=user.content,
+                assistant_response=assistant.content,
+                tools_used=[],
+                turn_id=record.turn_id,
+                client_message_id=record.client_message_id,
+                persisted_user_message_id=user.id,
+                assistant_message_id=assistant.id,
+            ),
+            input_row_id=record.row_id,
+        )
 
     async def _publish_pending(self) -> None:
         """Publish durable rows and advance their SQLite cursor after receipt."""
@@ -390,6 +517,32 @@ def _decode_outbox_payload(payload_json: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise TypeError("proactive_feedback outbox payload 必须是 object")
     return payload
+
+
+def _assistant_for_input(
+    rows: list[MessageRow],
+    record: FeedbackInputRecord,
+) -> MessageRow | None:
+    if record.assistant_message_id is not None:
+        return next(
+            (
+                row
+                for row in rows
+                if row.role == "assistant" and row.id == record.assistant_message_id
+            ),
+            None,
+        )
+    user = next(
+        (row for row in rows if row.role == "user" and row.id == record.user_message_id),
+        None,
+    )
+    if user is None:
+        return None
+    return min(
+        (row for row in rows if row.role == "assistant" and row.seq > user.seq),
+        key=lambda row: row.seq,
+        default=None,
+    )
 
 
 async def _no_embed(texts: list[str]) -> list[list[float]]:

@@ -34,6 +34,18 @@ class FeedbackOutboxRecord:
     payload_json: str
 
 
+@dataclass(frozen=True)
+class FeedbackInputRecord:
+    """Describe one committed Turn identity waiting for durable processing."""
+
+    row_id: int
+    session_key: str
+    turn_id: str
+    client_message_id: str
+    user_message_id: str
+    assistant_message_id: str | None
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     """Open the plugin-owned SQLite projection and its durable event ledger."""
 
@@ -76,6 +88,21 @@ def open_db(path: Path) -> sqlite3.Connection:
         ON proactive_feedback_events(proactive_message_id)
         WHERE proactive_message_id IS NOT NULL;
 
+        CREATE TABLE IF NOT EXISTS proactive_feedback_input_inbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            session_key TEXT NOT NULL,
+            turn_id TEXT NOT NULL DEFAULT '',
+            client_message_id TEXT NOT NULL DEFAULT '',
+            user_message_id TEXT NOT NULL,
+            assistant_message_id TEXT,
+            processed_at TEXT,
+            UNIQUE(session_key, user_message_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pfe_input_pending
+        ON proactive_feedback_input_inbox(processed_at, id);
+
         CREATE TABLE IF NOT EXISTS proactive_feedback_outbox (
             row_id INTEGER PRIMARY KEY,
             event_id TEXT NOT NULL UNIQUE,
@@ -112,8 +139,9 @@ def insert_feedback(conn: sqlite3.Connection, event: FeedbackEvent) -> int | Non
     existing_id = _existing_feedback_id(conn, event)
     if existing_id is not None:
         try:
-            _update_feedback_row(conn, event, existing_id)
-            _upsert_feedback_outbox(conn, event, existing_id)
+            if not _feedback_is_published(conn, existing_id):
+                _update_feedback_row(conn, event, existing_id)
+                _upsert_feedback_outbox(conn, event, existing_id)
             conn.commit()
         except (sqlite3.Error, RuntimeError, TypeError, ValueError):
             conn.rollback()
@@ -130,6 +158,138 @@ def insert_feedback(conn: sqlite3.Connection, event: FeedbackEvent) -> int | Non
         conn.rollback()
         raise
     return row_id
+
+
+def insert_feedback_input(
+    conn: sqlite3.Connection,
+    *,
+    session_key: str,
+    turn_id: str,
+    client_message_id: str,
+    user_message_id: str,
+    assistant_message_id: str | None,
+) -> int:
+    """Durably record one committed Turn identity without storing message text."""
+
+    # 1. Validate the identity that the recovery reader will use.
+    _required_input_text(session_key, "session_key")
+    _required_input_text(user_message_id, "user_message_id")
+    _optional_input_text(turn_id, "turn_id")
+    _optional_input_text(client_message_id, "client_message_id")
+    if assistant_message_id is not None:
+        _required_input_text(assistant_message_id, "assistant_message_id")
+
+    # 2. Preserve one durable row for duplicate committed events.
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM proactive_feedback_input_inbox
+        WHERE session_key = ? AND user_message_id = ?
+        LIMIT 1
+        """,
+        (session_key, user_message_id),
+    ).fetchone()
+    if existing is not None:
+        return int(existing["id"])
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO proactive_feedback_input_inbox(
+                session_key, turn_id, client_message_id,
+                user_message_id, assistant_message_id
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                session_key,
+                turn_id,
+                client_message_id,
+                user_message_id,
+                assistant_message_id,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("feedback input insert failed")
+        row_id = int(cursor.lastrowid)
+        conn.commit()
+        return row_id
+    except (sqlite3.Error, RuntimeError, ValueError):
+        conn.rollback()
+        raise
+
+
+def pending_feedback_inputs(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 100,
+) -> list[FeedbackInputRecord]:
+    """Read unprocessed committed Turn identities in durable row order."""
+
+    # 1. Bound the recovery batch before reading the durable inbox.
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("input inbox limit 必须是正整数")
+    rows = conn.execute(
+        """
+        SELECT id, session_key, turn_id, client_message_id,
+               user_message_id, assistant_message_id
+        FROM proactive_feedback_input_inbox
+        WHERE processed_at IS NULL
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [_feedback_input_record(row) for row in rows]
+
+
+def pending_feedback_input(
+    conn: sqlite3.Connection,
+    *,
+    row_id: int,
+) -> FeedbackInputRecord | None:
+    """Read one pending committed Turn identity for the in-memory wake path."""
+
+    if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id < 1:
+        raise ValueError("input inbox row_id 必须是正整数")
+    row = conn.execute(
+        """
+        SELECT id, session_key, turn_id, client_message_id,
+               user_message_id, assistant_message_id
+        FROM proactive_feedback_input_inbox
+        WHERE id = ? AND processed_at IS NULL
+        """,
+        (row_id,),
+    ).fetchone()
+    return None if row is None else _feedback_input_record(row)
+
+
+def mark_feedback_input_processed(
+    conn: sqlite3.Connection,
+    *,
+    row_id: int,
+) -> None:
+    """Record successful handling of one durable committed Turn identity."""
+
+    # 1. Validate the receipt identity before changing the inbox state.
+    if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id < 1:
+        raise ValueError("input inbox row_id 必须是正整数")
+    update = conn.execute(
+        """
+        UPDATE proactive_feedback_input_inbox
+        SET processed_at = datetime('now')
+        WHERE id = ? AND processed_at IS NULL
+        """,
+        (row_id,),
+    )
+    if update.rowcount == 0:
+        existing = conn.execute(
+            "SELECT id FROM proactive_feedback_input_inbox WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+        if existing is None:
+            conn.rollback()
+            raise RuntimeError("input inbox receipt 不匹配 pending row")
+    conn.commit()
 
 
 def _feedback_owned_by_other(
@@ -164,6 +324,18 @@ def _existing_feedback_id(
         (event.user_message_id, event.proactive_message_id),
     ).fetchone()
     return None if row is None else int(row["id"])
+
+
+def _feedback_is_published(conn: sqlite3.Connection, row_id: int) -> bool:
+    row = conn.execute(
+        """
+        SELECT published_at
+        FROM proactive_feedback_outbox
+        WHERE row_id = ?
+        """,
+        (row_id,),
+    ).fetchone()
+    return row is not None and row["published_at"] is not None
 
 
 def _update_feedback_row(
@@ -203,19 +375,22 @@ def _update_feedback_row(
 def _remove_previous_feedback(conn: sqlite3.Connection, user_message_id: str) -> None:
     pending = conn.execute(
         """
-        SELECT row_id
-        FROM proactive_feedback_outbox
-        WHERE row_id IN (
-            SELECT id FROM proactive_feedback_events WHERE user_message_id = ?
-        ) AND published_at IS NULL
+        SELECT events.id, outbox.row_id
+        FROM proactive_feedback_events AS events
+        LEFT JOIN proactive_feedback_outbox AS outbox
+          ON outbox.row_id = events.id
+        WHERE events.user_message_id = ?
+          AND (outbox.row_id IS NULL OR outbox.published_at IS NULL)
         """,
         (user_message_id,),
     ).fetchall()
-    _ = conn.execute(
-        "DELETE FROM proactive_feedback_events WHERE user_message_id = ?",
-        (user_message_id,),
-    )
     for row in pending:
+        _ = conn.execute(
+            "DELETE FROM proactive_feedback_events WHERE id = ?",
+            (int(row["id"]),),
+        )
+        if row["row_id"] is None:
+            continue
         _ = conn.execute(
             "DELETE FROM proactive_feedback_outbox WHERE row_id = ?",
             (int(row["row_id"]),),
@@ -313,6 +488,35 @@ def _feedback_payload(event_id: str, event: FeedbackEvent) -> dict[str, object]:
         "assistant_content_preview": event.assistant_content_preview,
         "proactive_content_preview": event.proactive_content_preview,
     }
+
+
+def _feedback_input_record(row: sqlite3.Row) -> FeedbackInputRecord:
+    return FeedbackInputRecord(
+        row_id=int(row["id"]),
+        session_key=str(row["session_key"]),
+        turn_id=str(row["turn_id"]),
+        client_message_id=str(row["client_message_id"]),
+        user_message_id=str(row["user_message_id"]),
+        assistant_message_id=(
+            None
+            if row["assistant_message_id"] is None
+            else str(row["assistant_message_id"])
+        ),
+    )
+
+
+def _required_input_text(value: str, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"input inbox {field} 必须是非空字符串")
+    if value != value.strip():
+        raise ValueError(f"input inbox {field} 不能有首尾空白")
+
+
+def _optional_input_text(value: str, field: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"input inbox {field} 必须是字符串")
+    if value != value.strip():
+        raise ValueError(f"input inbox {field} 不能有首尾空白")
 
 
 def pending_feedback_outbox(
