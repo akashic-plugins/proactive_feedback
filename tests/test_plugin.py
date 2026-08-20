@@ -1025,12 +1025,7 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         workspace=tmp_path / "workspace",
         installed_cache_root=tmp_path / "home" / "cache",
     )
-    dashboard_host = PluginDashboardHost(
-        workspace=tmp_path / "workspace",
-        memory_admin=object(),
-        memory_store=object(),
-        core_routes=(),
-    )
+    dashboard_host = PluginDashboardHost(core_routes=())
     try:
         await manager.load_all()
         stable = manager.current_snapshot

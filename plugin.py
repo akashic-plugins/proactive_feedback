@@ -105,7 +105,7 @@ async def apply(ctx: Context, config: object) -> None:
                 description="主动消息是否被继续，以及对应的回应链路",
             ),
         ),
-        query=runtime.mobile_ui_query,
+        query=runtime.query_mobile,
     )
     await ctx.spawn(runtime.run_worker(), name="proactive_feedback_worker")
 
@@ -192,7 +192,7 @@ class ProactiveFeedbackRuntime:
             finally:
                 self._queue.task_done()
 
-    def mobile_ui_query(
+    def query_mobile(
         self,
         method: str,
         payload: dict[str, object],
