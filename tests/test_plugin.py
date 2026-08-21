@@ -20,6 +20,7 @@ from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
 from agent.plugins.manager import PluginManager
 from agent.plugins.mobile_ui import PluginMobileUiProvider
 from agent.plugins.manifest import write_plugin_manifest
+from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
 from agent.turn_events.proactive_feedback import ProactiveFeedbackCommitted
 from bus.events_lifecycle import TurnCommitted
 from bus.event_bus import EventBus
@@ -1077,6 +1078,10 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         assert binding.validation is True
         assert binding.runtime_data_root is not None
         assert binding.runtime_data_root != formal_data.resolve()
+        assert not (binding.runtime_data_root / "proactive_feedback.db").exists()
+        candidate_root = candidate_snapshot.composition_root
+        assert candidate_root is not None
+        candidate_root.context.emit(AFTER_TURN_COMMITTED, _event())
         assert not (binding.runtime_data_root / "proactive_feedback.db").exists()
         assert hashlib.sha256(formal_database.read_bytes()).hexdigest() == formal_digest
         await manager.discard_prepared("proactive_feedback")
