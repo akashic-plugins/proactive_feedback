@@ -1,0 +1,14 @@
+schema_version = 1
+name = "proactive_feedback"
+version = "3.0.0"
+api_version = 3
+entrypoint = "plugin.py"
+
+[validation]
+exclude_data_paths = [
+  "proactive_feedback.db",
+  "proactive_feedback.db-wal",
+  "proactive_feedback.db-shm",
+  "proactive_feedback.db-journal",
+  ".proactive-feedback-v2-migration.json",
+]

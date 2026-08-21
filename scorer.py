@@ -6,6 +6,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 
@@ -40,6 +41,24 @@ class FeedbackScore:
 
 class EmbedBatch(Protocol):
     async def __call__(self, texts: list[str]) -> list[list[float]]: ...
+
+
+def message_rows_from_snapshot(
+    messages: Sequence[Mapping[str, object]],
+) -> list[MessageRow]:
+    """将 Core 脱离持久化 owner 的消息快照转换成评分行。"""
+
+    return [
+        MessageRow(
+            id=str(message["id"]),
+            seq=_required_int(message["seq"], field="seq"),
+            role=str(message["role"]),
+            content=str(message.get("content") or ""),
+            extra=_optional_string(message.get("extra")),
+            ts=str(message.get("ts") or ""),
+        )
+        for message in messages
+    ]
 
 
 def clean_text(text: str, max_chars: int = 1200) -> str:
@@ -129,6 +148,33 @@ def latest_turn_messages(
     return _row(user), _row(assistant)
 
 
+def latest_turn_messages_from_rows(
+    rows: Sequence[MessageRow],
+    *,
+    user_message_id: str | None,
+    assistant_message_id: str | None,
+    user_content: str,
+    assistant_content: str,
+) -> tuple[MessageRow, MessageRow] | None:
+    """按 TurnCommitted 身份从脱离快照解析本次 user/assistant。"""
+
+    user = _latest_snapshot_row(
+        rows,
+        role="user",
+        message_id=user_message_id,
+        content=user_content,
+    )
+    assistant = _latest_snapshot_row(
+        rows,
+        role="assistant",
+        message_id=assistant_message_id,
+        content=assistant_content,
+    )
+    if user is None or assistant is None:
+        return None
+    return user, assistant
+
+
 def iter_user_assistant_turns(
     conn: sqlite3.Connection,
 ) -> list[tuple[str, MessageRow, MessageRow]]:
@@ -212,6 +258,28 @@ def recent_proactive_messages(
     return proactive[:limit]
 
 
+def recent_proactive_messages_from_rows(
+    rows: Sequence[MessageRow],
+    *,
+    before_seq: int,
+    limit: int,
+) -> list[MessageRow]:
+    """从脱离快照取出当前 user 之前最近的主动 assistant。"""
+
+    recent = sorted(
+        (
+            row
+            for row in rows
+            if row.role == "assistant"
+            and row.seq < before_seq
+            and row.content
+        ),
+        key=lambda row: row.seq,
+        reverse=True,
+    )[: limit * 4]
+    return [row for row in recent if is_proactive(row.extra)][:limit]
+
+
 def proactive_since_previous_user(
     conn: sqlite3.Connection,
     *,
@@ -249,6 +317,33 @@ def proactive_since_previous_user(
     if limit is None:
         return proactive
     return proactive[:limit]
+
+
+def proactive_since_previous_user_from_rows(
+    rows: Sequence[MessageRow],
+    *,
+    before_seq: int,
+    limit: int | None = None,
+) -> list[MessageRow]:
+    """从脱离快照取出上一个 user 之后的主动 assistant。"""
+
+    previous = [
+        row for row in rows if row.role == "user" and row.seq < before_seq
+    ]
+    after_seq = max((row.seq for row in previous), default=-1)
+    candidates = sorted(
+        (
+            row
+            for row in rows
+            if row.role == "assistant"
+            and after_seq < row.seq < before_seq
+            and row.content
+            and is_proactive(row.extra)
+        ),
+        key=lambda row: row.seq,
+        reverse=True,
+    )
+    return candidates if limit is None else candidates[:limit]
 
 
 async def score_followup(
@@ -329,3 +424,34 @@ def _row(row: sqlite3.Row) -> MessageRow:
         extra=row["extra"],
         ts=str(row["ts"]),
     )
+
+
+def _latest_snapshot_row(
+    rows: Sequence[MessageRow],
+    *,
+    role: str,
+    message_id: str | None,
+    content: str,
+) -> MessageRow | None:
+    candidates = [row for row in rows if row.role == role]
+    if message_id is not None:
+        candidates = [row for row in candidates if row.id == message_id]
+    else:
+        candidates = [row for row in candidates if row.content == content]
+    if message_id is not None and candidates and content:
+        candidates = [row for row in candidates if row.content == content]
+    return max(candidates, key=lambda row: row.seq, default=None)
+
+
+def _optional_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("消息 extra 必须是字符串或 None")
+    return value
+
+
+def _required_int(value: object, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise TypeError(f"消息 {field} 必须是整数")
+    return int(value)

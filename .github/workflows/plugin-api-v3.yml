@@ -1,0 +1,70 @@
+name: plugin-api-v3
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: akashic-plugins/plugin-contracts
+          ref: 4dd69dd621e029e51e99aa428443fa3a4ec1f6cf
+          path: .plugin-contracts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check Plugin API v3
+        env:
+          PYTHONPATH: .plugin-contracts
+        run: python -m akashic_plugin_contracts check plugin.py
+
+  plugin-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kachofugetsu09/akashic-agent
+          ref: 07d5e622dfd62badb519c19c45b62c2066a7a087
+          path: .akashic-core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            .akashic-core/requirements.txt
+            .akashic-core/requirements-dev.txt
+      - name: Install exact Core runtime
+        run: python -m pip install -r .akashic-core/requirements.txt -r .akashic-core/requirements-dev.txt
+      - name: Run focused plugin tests
+        env:
+          AKASHIC_AGENT_ROOT: .akashic-core
+          PYTHONPATH: .akashic-core
+        run: python -m pytest -q tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Verify mobile panel
+        run: node --test tests/test_mobile_panel.mjs
+      - name: Check v3 source types
+        env:
+          AKASHIC_AGENT_ROOT: .akashic-core
+          PYTHONPATH: .akashic-core
+        run: >-
+          pyright --level error plugin.py dashboard.py db.py scorer.py
+          scripts/migrate_v2_data.py scripts/migrate_feedback_previews.py tests
+      - name: Compile Python sources
+        run: python -m compileall -q plugin.py dashboard.py db.py scorer.py tests scripts
+      - name: Check diff formatting
+        run: git diff --check
