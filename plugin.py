@@ -93,8 +93,10 @@ async def apply(ctx: Context, config: object) -> None:
         ),
     )
 
-    # 2. Bind every executable contribution to this Fiber's lifecycle.
-    await ctx.on(AFTER_TURN_COMMITTED, runtime.enqueue)
+    # 2. Candidate Roots expose read-only projections without formal side effects.
+    if session_read.formal:
+        await ctx.on(AFTER_TURN_COMMITTED, runtime.enqueue)
+        await ctx.spawn(runtime.run_worker(), name="proactive_feedback_worker")
     await ui_slots.register_mobile(
         ctx,
         MobileUiDefinition(
@@ -107,7 +109,6 @@ async def apply(ctx: Context, config: object) -> None:
         ),
         query=runtime.query_mobile,
     )
-    await ctx.spawn(runtime.run_worker(), name="proactive_feedback_worker")
 
 
 class ProactiveFeedbackRuntime:
@@ -137,7 +138,7 @@ class ProactiveFeedbackRuntime:
         """Durably record one committed Turn identity and wake the worker."""
 
         # 1. Candidate validation has no formal Session or plugin data owner.
-        if getattr(self._session_read, "_lookup_existing", None) is None:
+        if not self._session_read.formal:
             raise RuntimeError("候选验证期禁止写入 proactive_feedback")
         if event.persisted_user_message is None or not _event_user_message_ids(event):
             return
