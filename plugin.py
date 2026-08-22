@@ -93,9 +93,9 @@ async def apply(ctx: Context, config: object) -> None:
         ),
     )
 
-    # 2. Candidate Roots expose read-only projections without formal side effects.
+    # 2. Candidate Root 保留同一 listener 拓扑，但不启动持久 worker。
+    await ctx.on(AFTER_TURN_COMMITTED, runtime.observe_committed)
     if session_read.formal:
-        await ctx.on(AFTER_TURN_COMMITTED, runtime.enqueue)
         await ctx.spawn(runtime.run_worker(), name="proactive_feedback_worker")
     await ui_slots.register_mobile(
         ctx,
@@ -133,6 +133,13 @@ class ProactiveFeedbackRuntime:
         self._queue: asyncio.Queue[int] = asyncio.Queue(maxsize=_QUEUE_MAX)
         self._embedder: Embedder | None = None
         self._discovery_done = False
+
+    def observe_committed(self, event: TurnCommitted) -> None:
+        """忽略候选事件，或入队一个正式提交的 Turn。"""
+
+        if not self._session_read.formal:
+            return
+        self.enqueue(event)
 
     def enqueue(self, event: TurnCommitted) -> None:
         """Durably record one committed Turn identity and wake the worker."""

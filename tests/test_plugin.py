@@ -1081,11 +1081,18 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         assert not (binding.runtime_data_root / "proactive_feedback.db").exists()
         candidate_root = candidate_snapshot.composition_root
         assert candidate_root is not None
+        assert candidate_snapshot.composition_topology is not None
+        assert stable.composition_topology is not None
+        assert (
+            candidate_snapshot.composition_topology.identity
+            == stable.composition_topology.identity
+        )
         candidate_root.context.emit(AFTER_TURN_COMMITTED, _event())
         assert not (binding.runtime_data_root / "proactive_feedback.db").exists()
         assert hashlib.sha256(formal_database.read_bytes()).hexdigest() == formal_digest
-        await manager.discard_prepared("proactive_feedback")
-        assert manager.current_snapshot is stable
+        result = await manager.publish_prepared("proactive_feedback")
+        assert result["publication_state"] == "committed"
+        assert manager.current_snapshot is not stable
     finally:
         await manager.terminate_all()
     receipt = stable.composition_root.receipt()
