@@ -1,26 +1,14 @@
 .proactive-feedback {
-  --feedback-follow: #39b9b1;
-  --feedback-follow-ink: #082f2c;
-  --feedback-quote: #bd8add;
-  --feedback-quote-ink: #321640;
-  --feedback-confidence: #7aa7ef;
-  --feedback-confidence-ink: #102d58;
-  --feedback-uncertain-ink: #6d4d00;
+  --feedback-follow: var(--ak-sys-color-success-container);
+  --feedback-follow-ink: var(--ak-sys-color-on-success-container);
+  --feedback-quote: var(--ak-sys-color-trace-container);
+  --feedback-quote-ink: var(--ak-sys-color-on-trace-container);
+  --feedback-confidence: var(--ak-color-action-container);
+  --feedback-confidence-ink: var(--ak-color-on-action-container);
+  --feedback-uncertain-ink: var(--ak-sys-color-warning);
   color: var(--ak-color-text-primary);
   font-family: Roboto, "Noto Sans SC", system-ui, sans-serif;
   font-synthesis: none;
-}
-
-@supports (color: oklch(0 0 0)) {
-  .proactive-feedback {
-    --feedback-follow: oklch(0.72 0.125 184);
-    --feedback-follow-ink: oklch(0.24 0.045 184);
-    --feedback-quote: oklch(0.72 0.13 310);
-    --feedback-quote-ink: oklch(0.27 0.065 310);
-    --feedback-confidence: oklch(0.72 0.12 255);
-    --feedback-confidence-ink: oklch(0.27 0.065 255);
-    --feedback-uncertain-ink: oklch(0.43 0.09 78);
-  }
 }
 
 .proactive-feedback-loading {
@@ -43,7 +31,7 @@
 
 .proactive-feedback-rate {
   display: flex;
-  min-height: 156px;
+  min-height: 132px;
   flex-direction: column;
   justify-content: flex-end;
   border-radius: var(--m-shape-large-increased, 20px);
@@ -53,7 +41,7 @@
 }
 
 .proactive-feedback-rate strong {
-  font-size: 2.75rem;
+  font-size: 2.25rem;
   font-weight: 650;
   letter-spacing: -0.045em;
   line-height: 0.95;
