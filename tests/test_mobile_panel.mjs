@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("../mobile_panel.js", import.meta.url), "utf8");
+const styles = await readFile(new URL("../mobile_panel.css", import.meta.url), "utf8");
 const panel = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 
 class FakeElement {
@@ -116,6 +117,16 @@ test("mobile panel keeps content in plugin-owned module", () => {
   assert.match(source, /用户回应/);
   assert.match(source, /助手继续/);
   assert.doesNotMatch(source, /window\.AkashicDashboard/);
+});
+
+test("mobile panel inherits semantic colors from the shared Material theme", () => {
+  assert.match(styles, /var\(--ak-sys-color-success-container\)/);
+  assert.match(styles, /var\(--ak-sys-color-on-success-container\)/);
+  assert.match(styles, /var\(--ak-sys-color-trace-container\)/);
+  assert.match(styles, /var\(--ak-sys-color-on-trace-container\)/);
+  assert.match(styles, /var\(--ak-color-action-container\)/);
+  assert.doesNotMatch(styles, /#[0-9a-f]{3,8}\b/i);
+  assert.doesNotMatch(styles, /oklch\([^,)]*\)/);
 });
 
 test("feedback row expands its relation and keeps aria state in sync", () => {
