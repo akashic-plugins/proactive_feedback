@@ -32,7 +32,9 @@ outbox，也不调用 Core Observe event。
 
 history reader 始终使用 SQLite `mode=ro`。数据库不存在表示合法空历史且不会创建目录；
 数据库存在但损坏、schema 异构或字段类型无效会 fail-loud，不能伪装成空页。插件不向
-`TurnCommitted.extra` 回写结果，也不依赖 Wake、Content 或消费者数据库。
+`TurnCommitted.extra` 回写结果，也不依赖 Wake、Content 或消费者数据库。已知正式旧表
+若尚无三个 preview 列，history 会把这三个稳定字段投影为 `null` 后参与 canonical hash；
+旧表经既有 `open_db` 逐列 `ALTER` 后形成的 SQLite schema 也属于同一已知 lineage。
 
 非引用评分使用 Core 正式运行时的共享 HTTP resources。嵌入配置从
 `AKASHIC_CONFIG` 指向的 Core 配置加载，不从插件 checkout 的当前目录猜测配置。

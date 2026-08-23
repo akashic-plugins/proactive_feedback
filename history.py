@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,59 @@ _FEEDBACK_TYPES = frozenset(
     {"explicit_quote", "topic_follow", "no_topic_follow", "unscored"}
 )
 _CONFIDENCE = frozenset({"gold", "high", "medium", "low"})
+
+
+def _normalize_sql(sql: str) -> str:
+    return "".join(sql.lower().split())
+
+
+_CURRENT_EVENTS_SQL = """
+CREATE TABLE proactive_feedback_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    session_key TEXT NOT NULL,
+    user_message_id TEXT NOT NULL,
+    assistant_message_id TEXT NOT NULL,
+    proactive_message_id TEXT,
+    feedback_type TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    pa_score REAL,
+    pua_score REAL,
+    lag_seconds INTEGER,
+    candidate_count INTEGER NOT NULL,
+    matched_by TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    user_content_preview TEXT,
+    assistant_content_preview TEXT,
+    proactive_content_preview TEXT,
+    UNIQUE(user_message_id, proactive_message_id)
+)
+"""
+_LEGACY_EVENTS_SQL = """
+CREATE TABLE proactive_feedback_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    session_key TEXT NOT NULL,
+    user_message_id TEXT NOT NULL,
+    assistant_message_id TEXT NOT NULL,
+    proactive_message_id TEXT,
+    feedback_type TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    pa_score REAL,
+    pua_score REAL,
+    lag_seconds INTEGER,
+    candidate_count INTEGER NOT NULL,
+    matched_by TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    UNIQUE(user_message_id, proactive_message_id)
+)
+"""
+_ALLOWED_EVENTS_SQL = frozenset(
+    {
+        _normalize_sql(_CURRENT_EVENTS_SQL),
+        _normalize_sql(_LEGACY_EVENTS_SQL),
+    }
+)
 _REQUIRED_COLUMNS = frozenset(
     {
         "id",
@@ -102,14 +156,21 @@ class SqliteFeedbackHistory:
         )
         connection.row_factory = sqlite3.Row
         try:
-            _validate_schema(connection)
+            columns = _validate_schema(connection)
+            previews = ", ".join(
+                column if column in columns else f"NULL AS {column}"
+                for column in (
+                    "user_content_preview",
+                    "assistant_content_preview",
+                    "proactive_content_preview",
+                )
+            )
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, session_key, user_message_id, assistant_message_id,
                        proactive_message_id, feedback_type, confidence,
                        pa_score, pua_score, lag_seconds, candidate_count,
-                       matched_by, reason, user_content_preview,
-                       assistant_content_preview, proactive_content_preview
+                       matched_by, reason, {previews}
                 FROM proactive_feedback_events
                 WHERE id > ?
                 ORDER BY id ASC
@@ -131,28 +192,42 @@ def accepted_payload_hash(payload: dict[str, object]) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _validate_schema(connection: sqlite3.Connection) -> None:
+def _validate_schema(connection: sqlite3.Connection) -> frozenset[str]:
     tables = {
-        str(row[0])
+        str(row[0]): str(row[1])
         for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
+            "SELECT name, sql FROM sqlite_master WHERE type='table'"
         )
     }
     if "proactive_feedback_events" not in tables:
         raise RuntimeError("proactive_feedback history 缺少 events 表")
+    if _normalize_sql(tables["proactive_feedback_events"]) not in _ALLOWED_EVENTS_SQL:
+        raise RuntimeError("proactive_feedback history events table schema 不匹配")
     columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(proactive_feedback_events)")
     }
-    missing = sorted(_REQUIRED_COLUMNS - columns)
+    required = _REQUIRED_COLUMNS.difference(
+        {
+            "user_content_preview",
+            "assistant_content_preview",
+            "proactive_content_preview",
+        }
+    )
+    missing = sorted(required - columns)
     if missing:
         raise RuntimeError(
             "proactive_feedback history schema 缺少列: " + ", ".join(missing)
         )
+    checks = tuple(tuple(row) for row in connection.execute("PRAGMA quick_check"))
+    if checks != (("ok",),):
+        raise RuntimeError("proactive_feedback history SQLite quick_check failed")
+    return frozenset(columns)
 
 
 def _record_from_row(row: sqlite3.Row) -> FeedbackHistoryRecord:
@@ -243,6 +318,6 @@ def _optional_score(value: object, field: str) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"history {field} 必须是数字或 null")
     score = float(value)
-    if score < -1.0 or score > 1.0:
+    if not math.isfinite(score) or score < -1.0 or score > 1.0:
         raise ValueError(f"history {field} 必须在 -1..1 之间")
     return score

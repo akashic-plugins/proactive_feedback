@@ -898,6 +898,28 @@ def test_history_corrupt_or_incompatible_database_fails_loud(tmp_path: Path) -> 
             after_cursor=0, max_items=10
         )
 
+    malformed = tmp_path / "same-columns-without-constraints.db"
+    valid = tmp_path / "valid-schema.db"
+    connection = module.open_db(valid)
+    try:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='proactive_feedback_events'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    malformed_sql = table_sql.replace(
+        "id INTEGER PRIMARY KEY AUTOINCREMENT", "id INTEGER"
+    ).replace(
+        ",\n            UNIQUE(user_message_id, proactive_message_id)", ""
+    )
+    with sqlite3.connect(malformed) as connection:
+        connection.execute(malformed_sql)
+    with pytest.raises(RuntimeError, match="events table schema 不匹配"):
+        module.SqliteFeedbackHistory(malformed).page(
+            after_cursor=0, max_items=10
+        )
+
     invalid_payload = tmp_path / "invalid-payload.db"
     connection = module.open_db(invalid_payload)
     try:
@@ -928,6 +950,90 @@ def test_history_corrupt_or_incompatible_database_fails_loud(tmp_path: Path) -> 
         module.SqliteFeedbackHistory(invalid_payload).page(
             after_cursor=0, max_items=10
         )
+
+    invalid_score = tmp_path / "invalid-score.db"
+    connection = module.open_db(invalid_score)
+    try:
+        module.insert_feedback(
+            connection,
+            FeedbackEvent(
+                session_key="mobile:test",
+                user_message_id="u1",
+                assistant_message_id="a1",
+                proactive_message_id="p1",
+                feedback_type="topic_follow",
+                confidence="high",
+                pa_score=0.8,
+                pua_score=0.7,
+                lag_seconds=1,
+                candidate_count=1,
+                matched_by="pua",
+                reason="fixture",
+            ),
+        )
+        connection.execute(
+            "UPDATE proactive_feedback_events SET pa_score=? WHERE id=1",
+            (float("inf"),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(ValueError, match="pa_score 必须在"):
+        module.SqliteFeedbackHistory(invalid_score).page(
+            after_cursor=0, max_items=10
+        )
+
+    history_module = sys.modules["proactive_feedback_v3_test.plugin.history"]
+    with pytest.raises(ValueError):
+        history_module.accepted_payload_hash({"score": float("nan")})
+
+
+def test_history_reads_exact_legacy_and_altered_table_lineage(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE proactive_feedback_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                session_key TEXT NOT NULL,
+                user_message_id TEXT NOT NULL,
+                assistant_message_id TEXT NOT NULL,
+                proactive_message_id TEXT,
+                feedback_type TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                pa_score REAL,
+                pua_score REAL,
+                lag_seconds INTEGER,
+                candidate_count INTEGER NOT NULL,
+                matched_by TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                UNIQUE(user_message_id, proactive_message_id)
+            );
+            INSERT INTO proactive_feedback_events(
+                session_key, user_message_id, assistant_message_id,
+                proactive_message_id, feedback_type, confidence, pa_score,
+                pua_score, lag_seconds, candidate_count, matched_by, reason
+            ) VALUES (
+                'mobile:test', 'u1', 'a1', 'p1', 'topic_follow', 'high',
+                0.8, 0.7, 1, 1, 'pua', 'legacy fixture'
+            );
+            """
+        )
+
+    legacy = module.SqliteFeedbackHistory(path).page(after_cursor=0, max_items=10)
+    assert legacy.records[0].user_content_preview is None
+
+    migrated = module.open_db(path)
+    migrated.close()
+    with sqlite3.connect(path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='proactive_feedback_events'"
+        ).fetchone()[0]
+    assert table_sql.index("user_content_preview") < table_sql.index("UNIQUE(")
+    page = module.SqliteFeedbackHistory(path).page(after_cursor=0, max_items=10)
+    assert page.records == legacy.records
 
 
 def test_history_pages_are_stable_and_new_rows_wait_for_next_page(tmp_path: Path) -> None:
