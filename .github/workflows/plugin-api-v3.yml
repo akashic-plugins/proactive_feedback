@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: kachofugetsu09/akashic-agent
-          ref: bad54a58135712793957cafede0b3e3ca89501ae
+          ref: 9da3a988a2bf62b0f550bd4f6bb98c4eeb1f56f5
           path: .akashic-core
       - uses: actions/setup-python@v5
         with:
@@ -62,9 +62,9 @@ jobs:
           AKASHIC_AGENT_ROOT: .akashic-core
           PYTHONPATH: .akashic-core
         run: >-
-          pyright --level error plugin.py dashboard.py db.py scorer.py
+          pyright --level error plugin.py dashboard.py db.py history.py scorer.py
           scripts/migrate_v2_data.py scripts/migrate_feedback_previews.py tests
       - name: Compile Python sources
-        run: python -m compileall -q plugin.py dashboard.py db.py scorer.py tests scripts
+        run: python -m compileall -q plugin.py dashboard.py db.py history.py scorer.py tests scripts
       - name: Check diff formatting
         run: git diff --check
