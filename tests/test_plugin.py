@@ -21,7 +21,6 @@ from agent.plugins.manager import PluginManager
 from agent.plugins.mobile_ui import PluginMobileUiProvider
 from agent.plugins.manifest import write_plugin_manifest
 from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
-from agent.turn_events.proactive_feedback import ProactiveFeedbackCommitted
 from bus.events_lifecycle import TurnCommitted
 from bus.event_bus import EventBus
 
@@ -217,6 +216,9 @@ def test_v2_runtime_symbols_are_not_used_by_module() -> None:
     assert "event_bus" not in source
     assert "sessions.db" not in source
     assert "ProactiveFeedbackRecorded" not in source
+    assert "PROACTIVE_FEEDBACK_COMMITTED" not in source
+    assert "CONTENT_SOURCE" not in source
+    assert "Content" not in source
     assert "event.extra" not in source
     assert "【你当前新消息】" not in source
 
@@ -287,40 +289,28 @@ async def test_committed_turn_writes_plugin_owned_projection(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_feedback_commit_publishes_typed_event_and_cursor(tmp_path: Path) -> None:
-    published: list[ProactiveFeedbackCommitted] = []
-
-    async def publish(event: ProactiveFeedbackCommitted) -> None:
-        published.append(event)
-
+async def test_feedback_commit_is_readable_from_stable_history(tmp_path: Path) -> None:
     runtime = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
         workspace=tmp_path,
         db_path=tmp_path / "data" / "proactive_feedback.db",
-        publish_feedback=publish,
     )
     await runtime._process(_event())
     await runtime._process(_event())
 
-    assert [event.event_id for event in published] == ["proactive_feedback:1"]
-    assert published[0].event_id == "proactive_feedback:1"
-    assert published[0].session_key == "mobile:test"
-    assert published[0].user_content_preview is not None
-    conn = sqlite3.connect(runtime._db_path)
-    try:
-        outbox = conn.execute(
-            "SELECT published_at FROM proactive_feedback_outbox"
-        ).fetchone()
-        cursor = conn.execute(
-            "SELECT row_id FROM proactive_feedback_published_cursor "
-            "WHERE name = 'proactive_feedback'"
-        ).fetchone()
-    finally:
-        conn.close()
-    assert outbox is not None and outbox[0] is not None
-    assert cursor == (1,)
+    page = module.SqliteFeedbackHistory(runtime._db_path).page(
+        after_cursor=0,
+        max_items=10,
+    )
+    assert [record.event_id for record in page.records] == ["proactive_feedback:1"]
+    assert page.records[0].session_key == "mobile:test"
+    assert len(page.records[0].payload_hash) == 64
+    with sqlite3.connect(runtime._db_path) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM proactive_feedback_outbox"
+        ).fetchone() == (0,)
 
 
 def test_committed_turn_identity_is_durable_without_message_text(tmp_path: Path) -> None:
@@ -369,11 +359,6 @@ def test_candidate_enqueue_fails_before_any_write(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_durable_input_replays_after_runtime_restart(tmp_path: Path) -> None:
-    published: list[ProactiveFeedbackCommitted] = []
-
-    async def publish(event: ProactiveFeedbackCommitted) -> None:
-        published.append(event)
-
     original = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
@@ -387,10 +372,11 @@ async def test_durable_input_replays_after_runtime_restart(tmp_path: Path) -> No
         session_read=original._session_read,
         workspace=tmp_path,
         db_path=original._db_path,
-        publish_feedback=publish,
     )
     assert await restarted._process_pending_inputs() is False
-    assert [event.event_id for event in published] == ["proactive_feedback:1"]
+    assert len(module.SqliteFeedbackHistory(original._db_path).page(
+        after_cursor=0, max_items=10
+    ).records) == 1
 
     conn = sqlite3.connect(original._db_path)
     try:
@@ -405,11 +391,6 @@ async def test_durable_input_replays_after_runtime_restart(tmp_path: Path) -> No
 async def test_durable_input_keeps_ordered_two_user_ids_and_scores_one_turn(
     tmp_path: Path,
 ) -> None:
-    published: list[ProactiveFeedbackCommitted] = []
-
-    async def publish(event: ProactiveFeedbackCommitted) -> None:
-        published.append(event)
-
     session_read = SessionReadService(
         lambda _key: (
             cast(Any, SimpleNamespace(
@@ -430,7 +411,6 @@ async def test_durable_input_keeps_ordered_two_user_ids_and_scores_one_turn(
         session_read=session_read,
         workspace=tmp_path,
         db_path=original._db_path,
-        publish_feedback=publish,
     )
     assert await restarted._process_pending_inputs() is False
 
@@ -450,20 +430,12 @@ async def test_durable_input_keeps_ordered_two_user_ids_and_scores_one_turn(
     assert inbox[2] is not None
     assert projection[0] == "u2"
     assert "被回复消息" in projection[1] and "当前新消息" in projection[1]
-    assert [event.event_id for event in published] == ["proactive_feedback:1"]
 
 
 @pytest.mark.asyncio
 async def test_formal_boot_discovers_committed_turn_without_callback_once(
     tmp_path: Path,
 ) -> None:
-    published: list[ProactiveFeedbackCommitted] = []
-    published_event = asyncio.Event()
-
-    async def publish(event: ProactiveFeedbackCommitted) -> None:
-        published.append(event)
-        published_event.set()
-
     session_read = SessionReadService(
         lambda _key: (
             cast(Any, _session_state()),
@@ -474,18 +446,21 @@ async def test_formal_boot_discovers_committed_turn_without_callback_once(
         session_read=session_read,
         workspace=tmp_path,
         db_path=tmp_path / "data" / "proactive_feedback.db",
-        publish_feedback=publish,
         session_keys=lambda: ("mobile:test",),
     )
 
     worker = asyncio.create_task(restarted.run_worker())
-    await asyncio.wait_for(published_event.wait(), timeout=1)
+    for _ in range(100):
+        if restarted._db_path.exists() and module.SqliteFeedbackHistory(
+            restarted._db_path
+        ).page(after_cursor=0, max_items=10).records:
+            break
+        await asyncio.sleep(0.01)
     worker.cancel()
     with pytest.raises(asyncio.CancelledError):
         await worker
     restarted._discover_committed_inputs()
 
-    assert [event.event_id for event in published] == ["proactive_feedback:1"]
     conn = sqlite3.connect(restarted._db_path)
     try:
         assert conn.execute(
@@ -643,7 +618,7 @@ async def test_durable_input_cancellation_keeps_pending_row(
         conn.close()
 
 
-def test_published_feedback_identity_is_immutable(tmp_path: Path) -> None:
+def test_accepted_feedback_identity_is_immutable_and_drift_fails(tmp_path: Path) -> None:
     sink = module.open_db(tmp_path / "proactive_feedback.db")
     try:
         first = FeedbackEvent(
@@ -665,11 +640,6 @@ def test_published_feedback_identity_is_immutable(tmp_path: Path) -> None:
         )
         row_id = module.insert_feedback(sink, first)
         assert row_id == 1
-        module.mark_feedback_published(
-            sink,
-            row_id=row_id,
-            event_id="proactive_feedback:1",
-        )
         second = FeedbackEvent(
             **{
                 **first.__dict__,
@@ -683,25 +653,25 @@ def test_published_feedback_identity_is_immutable(tmp_path: Path) -> None:
                 "proactive_content_preview": "second proactive",
             }
         )
-        assert module.insert_feedback(sink, second) == row_id
+        with pytest.raises(RuntimeError, match="payload 漂移"):
+            module.insert_feedback(sink, second)
         third = FeedbackEvent(
             **{**first.__dict__, "proactive_message_id": "p2"}
         )
-        assert module.insert_feedback(sink, third) == 2
+        with pytest.raises(RuntimeError, match="payload 漂移"):
+            module.insert_feedback(sink, third)
+        assert module.insert_feedback(sink, first) == row_id
         assert tuple(sink.execute(
             "SELECT count(*) FROM proactive_feedback_events"
-        ).fetchone()) == (2,)
+        ).fetchone()) == (1,)
         projection = tuple(sink.execute(
             "SELECT feedback_type, confidence, pa_score, pua_score, reason, "
             "user_content_preview, assistant_content_preview, proactive_content_preview "
             "FROM proactive_feedback_events WHERE id = 1"
         ).fetchone())
-        payload = json.loads(
-            sink.execute(
-                "SELECT payload_json FROM proactive_feedback_outbox "
-                "WHERE row_id = 1"
-            ).fetchone()[0]
-        )
+        assert tuple(sink.execute(
+            "SELECT count(*) FROM proactive_feedback_outbox"
+        ).fetchone()) == (0,)
     finally:
         sink.close()
     assert projection == (
@@ -714,85 +684,6 @@ def test_published_feedback_identity_is_immutable(tmp_path: Path) -> None:
         "first answer",
         "first proactive",
     )
-    assert payload["reason"] == "first_reason"
-    assert payload["pa_score"] == 1.0
-
-
-@pytest.mark.asyncio
-async def test_failed_publication_is_replayed_after_restart(tmp_path: Path) -> None:
-    async def fail(_event: ProactiveFeedbackCommitted) -> None:
-        raise RuntimeError("observer unavailable")
-
-    runtime = module.ProactiveFeedbackRuntime(
-        session_read=SessionReadService(
-            lambda _key: (cast(Any, _session_state()), None)
-        ),
-        workspace=tmp_path,
-        db_path=tmp_path / "data" / "proactive_feedback.db",
-        publish_feedback=fail,
-    )
-    with pytest.raises(RuntimeError, match="observer unavailable"):
-        await runtime._process(_event())
-
-    conn = sqlite3.connect(runtime._db_path)
-    try:
-        assert conn.execute(
-            "SELECT published_at FROM proactive_feedback_outbox"
-        ).fetchone() == (None,)
-    finally:
-        conn.close()
-
-    replayed: list[ProactiveFeedbackCommitted] = []
-
-    async def publish(event: ProactiveFeedbackCommitted) -> None:
-        replayed.append(event)
-
-    restarted = module.ProactiveFeedbackRuntime(
-        session_read=SessionReadService.candidate_validation(),
-        workspace=tmp_path,
-        db_path=runtime._db_path,
-        publish_feedback=publish,
-    )
-    await restarted._publish_pending()
-    assert [event.event_id for event in replayed] == ["proactive_feedback:1"]
-    conn = sqlite3.connect(runtime._db_path)
-    try:
-        assert conn.execute(
-            "SELECT published_at FROM proactive_feedback_outbox"
-        ).fetchone()[0] is not None
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_publication_cancellation_keeps_pending_receipt(tmp_path: Path) -> None:
-    started = asyncio.Event()
-
-    async def blocked(_event: ProactiveFeedbackCommitted) -> None:
-        started.set()
-        await asyncio.Future()
-
-    runtime = module.ProactiveFeedbackRuntime(
-        session_read=SessionReadService(
-            lambda _key: (cast(Any, _session_state()), None)
-        ),
-        workspace=tmp_path,
-        db_path=tmp_path / "data" / "proactive_feedback.db",
-        publish_feedback=blocked,
-    )
-    task = asyncio.create_task(runtime._process(_event()))
-    await started.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    conn = sqlite3.connect(runtime._db_path)
-    try:
-        assert conn.execute(
-            "SELECT published_at FROM proactive_feedback_outbox"
-        ).fetchone() == (None,)
-    finally:
-        conn.close()
 
 
 @pytest.mark.asyncio
@@ -940,47 +831,240 @@ def test_dashboard_reads_preview_projection_without_sessions_database(tmp_path: 
     assert items[0]["assistant_preview"] == "回答"
 
 
-def test_feedback_projection_and_outbox_commit_atomically(tmp_path: Path) -> None:
+def test_new_feedback_does_not_touch_frozen_legacy_outbox(tmp_path: Path) -> None:
     sink = module.open_db(tmp_path / "proactive_feedback.db")
     try:
         _ = sink.execute(
             """
-            CREATE TRIGGER reject_feedback_outbox
-            BEFORE INSERT ON proactive_feedback_outbox
-            BEGIN
-                SELECT RAISE(ABORT, 'outbox unavailable');
-            END;
+            INSERT INTO proactive_feedback_outbox(
+                row_id, event_id, payload_json, published_at
+            ) VALUES(91, 'legacy:91', '{"legacy":true}', '2026-08-01T00:00:00Z')
             """
         )
-        with pytest.raises(sqlite3.IntegrityError, match="outbox unavailable"):
-            module.insert_feedback(
-                sink,
-                FeedbackEvent(
-                    session_key="mobile:test",
-                    user_message_id="u1",
-                    assistant_message_id="a1",
-                    proactive_message_id="p1",
-                    feedback_type="explicit_quote",
-                    confidence="gold",
-                    pa_score=1.0,
-                    pua_score=1.0,
-                    lag_seconds=8,
-                    candidate_count=1,
-                    matched_by="explicit_quote",
-                    reason="explicit_quote",
-                    user_content_preview="继续",
-                    assistant_content_preview="回答",
-                    proactive_content_preview="主题",
-                ),
-            )
+        sink.commit()
+        before = tuple(sink.execute(
+            "SELECT * FROM proactive_feedback_outbox"
+        ).fetchone())
+        module.insert_feedback(
+            sink,
+            FeedbackEvent(
+                session_key="mobile:test",
+                user_message_id="u1",
+                assistant_message_id="a1",
+                proactive_message_id="p1",
+                feedback_type="explicit_quote",
+                confidence="gold",
+                pa_score=1.0,
+                pua_score=1.0,
+                lag_seconds=8,
+                candidate_count=1,
+                matched_by="explicit_quote",
+                reason="explicit_quote",
+                user_content_preview="继续",
+                assistant_content_preview="回答",
+                proactive_content_preview="主题",
+            ),
+        )
         assert tuple(sink.execute(
             "SELECT count(*) FROM proactive_feedback_events"
-        ).fetchone()) == (0,)
+        ).fetchone()) == (1,)
         assert tuple(sink.execute(
-            "SELECT count(*) FROM proactive_feedback_outbox"
-        ).fetchone()) == (0,)
+            "SELECT * FROM proactive_feedback_outbox"
+        ).fetchone()) == before
     finally:
         sink.close()
+
+
+def test_history_missing_database_is_empty_without_creation(tmp_path: Path) -> None:
+    path = tmp_path / "missing" / "proactive_feedback.db"
+    page = module.SqliteFeedbackHistory(path).page(after_cursor=0, max_items=10)
+    assert page.records == ()
+    assert not path.parent.exists()
+
+
+def test_history_corrupt_or_incompatible_database_fails_loud(tmp_path: Path) -> None:
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not sqlite")
+    before = corrupt.read_bytes()
+    with pytest.raises(sqlite3.DatabaseError):
+        module.SqliteFeedbackHistory(corrupt).page(after_cursor=0, max_items=10)
+    assert corrupt.read_bytes() == before
+
+    incompatible = tmp_path / "incompatible.db"
+    with sqlite3.connect(incompatible) as conn:
+        conn.execute("CREATE TABLE unrelated(value TEXT)")
+    with pytest.raises(RuntimeError, match="缺少 events 表"):
+        module.SqliteFeedbackHistory(incompatible).page(
+            after_cursor=0, max_items=10
+        )
+
+    malformed = tmp_path / "same-columns-without-constraints.db"
+    valid = tmp_path / "valid-schema.db"
+    connection = module.open_db(valid)
+    try:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='proactive_feedback_events'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    malformed_sql = table_sql.replace(
+        "id INTEGER PRIMARY KEY AUTOINCREMENT", "id INTEGER"
+    ).replace(
+        ",\n            UNIQUE(user_message_id, proactive_message_id)", ""
+    )
+    with sqlite3.connect(malformed) as connection:
+        connection.execute(malformed_sql)
+    with pytest.raises(RuntimeError, match="events table schema 不匹配"):
+        module.SqliteFeedbackHistory(malformed).page(
+            after_cursor=0, max_items=10
+        )
+
+    invalid_payload = tmp_path / "invalid-payload.db"
+    connection = module.open_db(invalid_payload)
+    try:
+        module.insert_feedback(
+            connection,
+            FeedbackEvent(
+                session_key="mobile:test",
+                user_message_id="u1",
+                assistant_message_id="a1",
+                proactive_message_id="p1",
+                feedback_type="topic_follow",
+                confidence="high",
+                pa_score=0.8,
+                pua_score=0.7,
+                lag_seconds=1,
+                candidate_count=1,
+                matched_by="pua",
+                reason="fixture",
+            ),
+        )
+        connection.execute(
+            "UPDATE proactive_feedback_events SET confidence='unknown' WHERE id=1"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(ValueError, match="confidence 不支持"):
+        module.SqliteFeedbackHistory(invalid_payload).page(
+            after_cursor=0, max_items=10
+        )
+
+    invalid_score = tmp_path / "invalid-score.db"
+    connection = module.open_db(invalid_score)
+    try:
+        module.insert_feedback(
+            connection,
+            FeedbackEvent(
+                session_key="mobile:test",
+                user_message_id="u1",
+                assistant_message_id="a1",
+                proactive_message_id="p1",
+                feedback_type="topic_follow",
+                confidence="high",
+                pa_score=0.8,
+                pua_score=0.7,
+                lag_seconds=1,
+                candidate_count=1,
+                matched_by="pua",
+                reason="fixture",
+            ),
+        )
+        connection.execute(
+            "UPDATE proactive_feedback_events SET pa_score=? WHERE id=1",
+            (float("inf"),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(ValueError, match="pa_score 必须在"):
+        module.SqliteFeedbackHistory(invalid_score).page(
+            after_cursor=0, max_items=10
+        )
+
+    history_module = sys.modules["proactive_feedback_v3_test.plugin.history"]
+    with pytest.raises(ValueError):
+        history_module.accepted_payload_hash({"score": float("nan")})
+
+
+def test_history_reads_exact_legacy_and_altered_table_lineage(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE proactive_feedback_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                session_key TEXT NOT NULL,
+                user_message_id TEXT NOT NULL,
+                assistant_message_id TEXT NOT NULL,
+                proactive_message_id TEXT,
+                feedback_type TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                pa_score REAL,
+                pua_score REAL,
+                lag_seconds INTEGER,
+                candidate_count INTEGER NOT NULL,
+                matched_by TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                UNIQUE(user_message_id, proactive_message_id)
+            );
+            INSERT INTO proactive_feedback_events(
+                session_key, user_message_id, assistant_message_id,
+                proactive_message_id, feedback_type, confidence, pa_score,
+                pua_score, lag_seconds, candidate_count, matched_by, reason
+            ) VALUES (
+                'mobile:test', 'u1', 'a1', 'p1', 'topic_follow', 'high',
+                0.8, 0.7, 1, 1, 'pua', 'legacy fixture'
+            );
+            """
+        )
+
+    legacy = module.SqliteFeedbackHistory(path).page(after_cursor=0, max_items=10)
+    assert legacy.records[0].user_content_preview is None
+
+    migrated = module.open_db(path)
+    migrated.close()
+    with sqlite3.connect(path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='proactive_feedback_events'"
+        ).fetchone()[0]
+    assert table_sql.index("user_content_preview") < table_sql.index("UNIQUE(")
+    page = module.SqliteFeedbackHistory(path).page(after_cursor=0, max_items=10)
+    assert page.records == legacy.records
+
+
+def test_history_pages_are_stable_and_new_rows_wait_for_next_page(tmp_path: Path) -> None:
+    path = tmp_path / "proactive_feedback.db"
+    sink = module.open_db(path)
+    try:
+        for index in range(3):
+            event = FeedbackEvent(
+                session_key="mobile:test",
+                user_message_id=f"u{index}",
+                assistant_message_id=f"a{index}",
+                proactive_message_id=f"p{index}",
+                feedback_type="topic_follow",
+                confidence="high",
+                pa_score=0.8,
+                pua_score=0.7,
+                lag_seconds=index,
+                candidate_count=1,
+                matched_by="pua",
+                reason="fixture",
+            )
+            module.insert_feedback(sink, event)
+    finally:
+        sink.close()
+    history = module.SqliteFeedbackHistory(path)
+    first = history.page(after_cursor=0, max_items=2)
+    assert [row.cursor for row in first.records] == [1, 2]
+    repeated = history.page(after_cursor=0, max_items=2)
+    assert repeated == first
+    second = history.page(after_cursor=2, max_items=2)
+    assert [row.cursor for row in second.records] == [3]
 
 
 def test_plugin_runtime_does_not_move_legacy_database(tmp_path: Path) -> None:
@@ -1008,6 +1092,7 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         "plugin.py",
         "dashboard.py",
         "db.py",
+        "history.py",
         "scorer.py",
         "mobile_panel.js",
         "mobile_panel.css",
@@ -1044,6 +1129,10 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
             "proactive_feedback"
         ).data_dir
         assert not (formal_data / "proactive_feedback.db").exists()
+        formal_history = stable.composition_root.context.require(
+            module.PROACTIVE_FEEDBACK_HISTORY
+        )
+        assert formal_history.page(after_cursor=0, max_items=10).records == ()
         formal_database = formal_data / "proactive_feedback.db"
         formal_database.parent.mkdir(parents=True, exist_ok=True)
         formal_connection = module.open_db(formal_database)
@@ -1081,6 +1170,10 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         assert not (binding.runtime_data_root / "proactive_feedback.db").exists()
         candidate_root = candidate_snapshot.composition_root
         assert candidate_root is not None
+        candidate_history = candidate_root.context.require(
+            module.PROACTIVE_FEEDBACK_HISTORY
+        )
+        assert candidate_history.page(after_cursor=0, max_items=10).records == ()
         assert candidate_snapshot.composition_topology is not None
         assert stable.composition_topology is not None
         assert (

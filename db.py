@@ -5,6 +5,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from .history import accepted_payload_hash
+
 
 @dataclass(frozen=True)
 class FeedbackEvent:
@@ -137,30 +139,27 @@ def open_db(path: Path) -> sqlite3.Connection:
 
 
 def insert_feedback(conn: sqlite3.Connection, event: FeedbackEvent) -> int | None:
-    """Atomically replace one feedback row and enqueue its typed event."""
+    """Append one immutable accepted feedback fact or verify an exact duplicate."""
 
     # 1. Reject a proactive message already owned by another user reply.
     if _feedback_owned_by_other(conn, event):
         return None
 
-    # 2. Keep one row identity for duplicate committed Turns.
-    existing_id = _existing_feedback_id(conn, event)
-    if existing_id is not None:
-        try:
-            if not _feedback_is_published(conn, existing_id):
-                _update_feedback_row(conn, event, existing_id)
-                _upsert_feedback_outbox(conn, event, existing_id)
-            conn.commit()
-        except (sqlite3.Error, RuntimeError, TypeError, ValueError):
-            conn.rollback()
-            raise
-        return existing_id
+    # 2. The first accepted payload owns the Turn identity forever.
+    existing = _existing_feedback(conn, event)
+    if existing is not None:
+        expected_hash = accepted_payload_hash(_accepted_payload(event))
+        actual_hash = accepted_payload_hash(_accepted_payload_from_row(existing))
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                "accepted feedback payload 漂移: "
+                f"proactive_feedback:{int(existing['id'])}"
+            )
+        return int(existing["id"])
 
-    # 3. Replace this user's previous projection and pending outbox row together.
+    # 3. Append the accepted fact without touching the frozen legacy outbox.
     try:
-        _remove_previous_feedback(conn, event.user_message_id)
         row_id = _insert_feedback_row(conn, event)
-        _upsert_feedback_outbox(conn, event, row_id)
         conn.commit()
     except (sqlite3.Error, RuntimeError, TypeError, ValueError):
         conn.rollback()
@@ -390,91 +389,68 @@ def _feedback_owned_by_other(
     return row is not None
 
 
-def _existing_feedback_id(
+def _existing_feedback(
     conn: sqlite3.Connection,
     event: FeedbackEvent,
-) -> int | None:
+) -> sqlite3.Row | None:
     row = conn.execute(
         """
-        SELECT id
+        SELECT id, session_key, user_message_id, assistant_message_id,
+               proactive_message_id, feedback_type, confidence,
+               pa_score, pua_score, lag_seconds, candidate_count,
+               matched_by, reason, user_content_preview,
+               assistant_content_preview, proactive_content_preview
         FROM proactive_feedback_events
-        WHERE user_message_id = ? AND proactive_message_id IS ?
+        WHERE session_key = ? AND user_message_id = ?
+        ORDER BY id ASC
         LIMIT 1
         """,
-        (event.user_message_id, event.proactive_message_id),
+        (event.session_key, event.user_message_id),
     ).fetchone()
-    return None if row is None else int(row["id"])
+    return row
 
 
-def _feedback_is_published(conn: sqlite3.Connection, row_id: int) -> bool:
-    row = conn.execute(
-        """
-        SELECT published_at
-        FROM proactive_feedback_outbox
-        WHERE row_id = ?
-        """,
-        (row_id,),
-    ).fetchone()
-    return row is not None and row["published_at"] is not None
+def _accepted_payload(event: FeedbackEvent) -> dict[str, object]:
+    return {
+        "session_key": event.session_key,
+        "user_message_id": event.user_message_id,
+        "assistant_message_id": event.assistant_message_id,
+        "proactive_message_id": event.proactive_message_id,
+        "feedback_type": event.feedback_type,
+        "confidence": event.confidence,
+        "pa_score": event.pa_score,
+        "pua_score": event.pua_score,
+        "lag_seconds": event.lag_seconds,
+        "candidate_count": event.candidate_count,
+        "matched_by": event.matched_by,
+        "reason": event.reason,
+        "user_content_preview": event.user_content_preview,
+        "assistant_content_preview": event.assistant_content_preview,
+        "proactive_content_preview": event.proactive_content_preview,
+    }
 
 
-def _update_feedback_row(
-    conn: sqlite3.Connection,
-    event: FeedbackEvent,
-    row_id: int,
-) -> None:
-    _ = conn.execute(
-        """
-        UPDATE proactive_feedback_events
-        SET session_key = ?, assistant_message_id = ?, feedback_type = ?,
-            confidence = ?, pa_score = ?, pua_score = ?, lag_seconds = ?,
-            candidate_count = ?, matched_by = ?, reason = ?,
-            user_content_preview = ?, assistant_content_preview = ?,
-            proactive_content_preview = ?
-        WHERE id = ?
-        """,
-        (
-            event.session_key,
-            event.assistant_message_id,
-            event.feedback_type,
-            event.confidence,
-            event.pa_score,
-            event.pua_score,
-            event.lag_seconds,
-            event.candidate_count,
-            event.matched_by,
-            event.reason,
-            event.user_content_preview,
-            event.assistant_content_preview,
-            event.proactive_content_preview,
-            row_id,
-        ),
-    )
-
-
-def _remove_previous_feedback(conn: sqlite3.Connection, user_message_id: str) -> None:
-    pending = conn.execute(
-        """
-        SELECT events.id, outbox.row_id
-        FROM proactive_feedback_events AS events
-        LEFT JOIN proactive_feedback_outbox AS outbox
-          ON outbox.row_id = events.id
-        WHERE events.user_message_id = ?
-          AND (outbox.row_id IS NULL OR outbox.published_at IS NULL)
-        """,
-        (user_message_id,),
-    ).fetchall()
-    for row in pending:
-        _ = conn.execute(
-            "DELETE FROM proactive_feedback_events WHERE id = ?",
-            (int(row["id"]),),
+def _accepted_payload_from_row(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        field: row[field]
+        for field in (
+            "session_key",
+            "user_message_id",
+            "assistant_message_id",
+            "proactive_message_id",
+            "feedback_type",
+            "confidence",
+            "pa_score",
+            "pua_score",
+            "lag_seconds",
+            "candidate_count",
+            "matched_by",
+            "reason",
+            "user_content_preview",
+            "assistant_content_preview",
+            "proactive_content_preview",
         )
-        if row["row_id"] is None:
-            continue
-        _ = conn.execute(
-            "DELETE FROM proactive_feedback_outbox WHERE row_id = ?",
-            (int(row["row_id"]),),
-        )
+    }
 
 
 def _insert_feedback_row(conn: sqlite3.Connection, event: FeedbackEvent) -> int:
@@ -509,65 +485,6 @@ def _insert_feedback_row(conn: sqlite3.Connection, event: FeedbackEvent) -> int:
     if cursor.lastrowid is None:
         raise RuntimeError("feedback insert failed")
     return int(cursor.lastrowid)
-
-
-def _upsert_feedback_outbox(
-    conn: sqlite3.Connection,
-    event: FeedbackEvent,
-    row_id: int,
-) -> None:
-    event_id = f"proactive_feedback:{row_id}"
-    payload_json = json.dumps(
-        _feedback_payload(event_id, event),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    outbox = conn.execute(
-        """
-        SELECT published_at
-        FROM proactive_feedback_outbox
-        WHERE row_id = ? AND event_id = ?
-        """,
-        (row_id, event_id),
-    ).fetchone()
-    if outbox is None:
-        _ = conn.execute(
-            """
-            INSERT INTO proactive_feedback_outbox(row_id, event_id, payload_json)
-            VALUES (?, ?, ?)
-            """,
-            (row_id, event_id, payload_json),
-        )
-    elif outbox["published_at"] is None:
-        _ = conn.execute(
-            """
-            UPDATE proactive_feedback_outbox
-            SET payload_json = ?
-            WHERE row_id = ? AND event_id = ?
-            """,
-            (payload_json, row_id, event_id),
-        )
-
-
-def _feedback_payload(event_id: str, event: FeedbackEvent) -> dict[str, object]:
-    return {
-        "event_id": event_id,
-        "session_key": event.session_key,
-        "user_message_id": event.user_message_id,
-        "assistant_message_id": event.assistant_message_id,
-        "proactive_message_id": event.proactive_message_id,
-        "feedback_type": event.feedback_type,
-        "confidence": event.confidence,
-        "pa_score": event.pa_score,
-        "pua_score": event.pua_score,
-        "lag_seconds": event.lag_seconds,
-        "candidate_count": event.candidate_count,
-        "matched_by": event.matched_by,
-        "reason": event.reason,
-        "user_content_preview": event.user_content_preview,
-        "assistant_content_preview": event.assistant_content_preview,
-        "proactive_content_preview": event.proactive_content_preview,
-    }
 
 
 def _feedback_input_record(row: sqlite3.Row) -> FeedbackInputRecord:

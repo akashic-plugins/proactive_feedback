@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,10 +19,6 @@ from agent.plugin_composition import (
     UI_SLOTS,
 )
 from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
-from agent.turn_events.proactive_feedback import (
-    PROACTIVE_FEEDBACK_COMMITTED,
-    ProactiveFeedbackCommitted,
-)
 from bus.events_lifecycle import TurnCommitted
 from core.net.http import get_default_http_requester
 from memory2.embedder import Embedder
@@ -36,11 +32,9 @@ from .db import (
     insert_feedback,
     insert_feedback_input,
     mark_feedback_input_processed,
-    mark_feedback_published,
     open_db,
     pending_feedback_input,
     pending_feedback_inputs,
-    pending_feedback_outbox,
 )
 from .scorer import (
     MessageRow,
@@ -50,6 +44,7 @@ from .scorer import (
     recent_proactive_messages_from_rows,
     score_followup,
 )
+from .history import PROACTIVE_FEEDBACK_HISTORY, SqliteFeedbackHistory
 
 logger = logging.getLogger("plugin.proactive_feedback")
 
@@ -60,8 +55,6 @@ _OUTBOX_BATCH_SIZE = 100
 _OUTBOX_RETRY_SECONDS = 1.0
 _DISCOVERY_SESSION_LIMIT = 64
 _DISCOVERY_TURN_LIMIT = 256
-
-FeedbackPublisher = Callable[[ProactiveFeedbackCommitted], Awaitable[None]]
 
 api_version = 3
 name = "proactive_feedback"
@@ -87,10 +80,10 @@ async def apply(ctx: Context, config: object) -> None:
         session_read=session_read,
         workspace=ctx.runtime.workspace,
         db_path=db_path,
-        publish_feedback=lambda event: ctx.observe(
-            PROACTIVE_FEEDBACK_COMMITTED,
-            event,
-        ),
+    )
+    _ = await ctx.provide(
+        PROACTIVE_FEEDBACK_HISTORY,
+        SqliteFeedbackHistory(db_path),
     )
 
     # 2. Candidate Root 保留同一 listener 拓扑，但不启动持久 worker。
@@ -120,13 +113,11 @@ class ProactiveFeedbackRuntime:
         session_read: SessionReadService,
         workspace: Path,
         db_path: Path,
-        publish_feedback: FeedbackPublisher | None = None,
         session_keys: Callable[[], Iterable[str]] | None = None,
     ) -> None:
         self._session_read = session_read
         self._workspace = workspace
         self._db_path = db_path
-        self._publish_feedback = publish_feedback
         self._session_keys = session_keys or (
             lambda: _formal_session_keys_from_read_service(session_read)
         )
@@ -170,14 +161,6 @@ class ProactiveFeedbackRuntime:
         while True:
             # 2. Replay every durable payload before waiting for new Turns.
             try:
-                await self._publish_pending()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("proactive_feedback outbox publish failed")
-                await asyncio.sleep(_OUTBOX_RETRY_SECONDS)
-                continue
-            try:
                 has_pending_inputs = await self._process_pending_inputs()
             except asyncio.CancelledError:
                 raise
@@ -189,7 +172,7 @@ class ProactiveFeedbackRuntime:
                 await asyncio.sleep(_OUTBOX_RETRY_SECONDS)
                 continue
 
-            # 3. Process one Core-committed Turn and drain its transaction's outbox.
+            # 3. Process one Core-committed Turn into immutable accepted history.
             input_row_id = await self._queue.get()
             try:
                 await self._process_input_row(input_row_id)
@@ -310,7 +293,6 @@ class ProactiveFeedbackRuntime:
                 reason="scoring_failed",
             )
             self._complete_input(input_row_id)
-            await self._publish_pending()
             return
         if scored is None:
             self._complete_input(input_row_id)
@@ -330,7 +312,6 @@ class ProactiveFeedbackRuntime:
             reason=scored.reason,
         )
         self._complete_input(input_row_id)
-        await self._publish_pending()
 
     async def _persist_feedback(
         self,
@@ -467,37 +448,6 @@ class ProactiveFeedbackRuntime:
             ),
             input_row_id=record.row_id,
         )
-
-    async def _publish_pending(self) -> None:
-        """Publish durable rows and advance their SQLite cursor after receipt."""
-
-        # 1. A candidate with no database and tests without a publisher stay inert.
-        if self._publish_feedback is None or not self._db_path.exists():
-            return
-        # 2. Publish outside SQLite; only a returned receipt advances state.
-        while True:
-            sink = open_db(self._db_path)
-            try:
-                pending = pending_feedback_outbox(sink, limit=_OUTBOX_BATCH_SIZE)
-            finally:
-                sink.close()
-            if not pending:
-                return
-            for record in pending:
-                payload = _decode_outbox_payload(record.payload_json)
-                if payload.get("event_id") != record.event_id:
-                    raise ValueError("proactive_feedback outbox event_id 不一致")
-                feedback = ProactiveFeedbackCommitted(**cast(Any, payload))
-                await self._publish_feedback(feedback)
-                sink = open_db(self._db_path)
-                try:
-                    mark_feedback_published(
-                        sink,
-                        row_id=record.row_id,
-                        event_id=record.event_id,
-                    )
-                finally:
-                    sink.close()
 
     def _get_embedder(self) -> Embedder:
         if self._embedder is None:

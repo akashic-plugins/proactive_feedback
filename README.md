@@ -17,24 +17,24 @@ Akashic proactive feedback plugin.
   assistant ID 写入 inbox，正文只在评分内存中重建。候选 generation 不执行 discovery，
   因而不会写正式 DB 或事件。
 
-### Durable typed event
+### Durable history pull
 
-Core exact `20062a715d2c5822228b327863b51c8d036119b3` 提供唯一的
-`agent.turn_events.proactive_feedback.PROACTIVE_FEEDBACK_COMMITTED` Observe seam。
-每次评分结果都在一次 SQLite commit 中同时写入 `proactive_feedback_events` 和
-`proactive_feedback_outbox`；commit 返回后才调用
-`ctx.observe(PROACTIVE_FEEDBACK_COMMITTED, ProactiveFeedbackCommitted(...))`。
+插件提供普通服务 `proactive-feedback.history.v1`。消费者按单调 `cursor` 调用
+`page(after_cursor, max_items)`；每条 accepted feedback 的 `event_id` 固定为
+`proactive_feedback:<cursor>`，`payload_hash` 是稳定字段 canonical JSON 的 SHA-256。
+分页最多 100 条，严格按 SQLite row id 递增。
 
-事件 `event_id` 固定为 `proactive_feedback:<row_id>`，DTO 使用 Core 的
-`session_key`、ordered user message identity（DTO 使用该 Turn 最后一条 user ID）、
-assistant/proactive message identity、评分、`reason` 和最多
-2400 字符的 user/assistant/proactive preview。全文不进入事件。发布成功后同库的
-`proactive_feedback_published_cursor` 与 outbox receipt 一起推进；发布失败、进程内
-取消或 Core 重启都会保留 pending 行，正式 generation 启动时按 row 顺序重放。消费方
-必须按 `event_id` 幂等。已发布的 projection/outbox receipt 是不可变事实；重复的
-同一 identity 即使评分不同，也不会改写已发布 DTO。待发布行才允许在同一 identity
-内更新；若关联 proactive identity 改变，则保留旧 published row 并创建新的 row/event。
-本插件不再向 `TurnCommitted.extra` 写入反馈，也不提供 marker fallback。
+`proactive_feedback_events` 是 accepted feedback 的唯一 owner。第一次 accepted payload
+写入后不可 UPDATE 或 DELETE；相同 Turn 的完全相同 payload 返回原 identity，任何字段
+漂移都 fail-loud。评分重试的中间计算不是新的领域事实，不另造 history。input inbox
+保留 Turn identity 与处理状态。旧 outbox/cursor schema 和既有行冻结保留，新链不再写
+outbox，也不调用 Core Observe event。
+
+history reader 始终使用 SQLite `mode=ro`。数据库不存在表示合法空历史且不会创建目录；
+数据库存在但损坏、schema 异构或字段类型无效会 fail-loud，不能伪装成空页。插件不向
+`TurnCommitted.extra` 回写结果，也不依赖 Wake、Content 或消费者数据库。已知正式旧表
+若尚无三个 preview 列，history 会把这三个稳定字段投影为 `null` 后参与 canonical hash；
+旧表经既有 `open_db` 逐列 `ALTER` 后形成的 SQLite schema 也属于同一已知 lineage。
 
 非引用评分使用 Core 正式运行时的共享 HTTP resources。嵌入配置从
 `AKASHIC_CONFIG` 指向的 Core 配置加载，不从插件 checkout 的当前目录猜测配置。
@@ -64,8 +64,8 @@ python scripts/migrate_feedback_previews.py \
 ```
 
 插件不再声明 v2 `Plugin` class、EventBus listener、`ProactiveFeedbackRecorded` 或 tool
-ABI；v3 运行路径只观察 Core 的 committed Turn，并通过上述 typed event 发布已持久化
-反馈。
+ABI；v3 运行路径只观察 Core 的 committed Turn，并通过上述只读 history service 暴露
+已持久化反馈。
 
 ## 移动端看板
 
