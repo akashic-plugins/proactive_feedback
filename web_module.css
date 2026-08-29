@@ -1,0 +1,37 @@
+.proactive-feedback-workbench-panel { max-width: 1180px; margin-inline: auto; }
+.proactive-feedback-workbench-panel > header { display: flex; align-items: end; justify-content: space-between; gap: 20px; }
+.proactive-feedback-workbench-panel h1, .proactive-feedback-workbench-panel h2, .proactive-feedback-workbench-panel h3, .proactive-feedback-workbench-panel h4, .proactive-feedback-workbench-panel p { margin: 0; }
+.proactive-feedback-workbench-panel > header p, .proactive-feedback-panel-row span, .proactive-feedback-panel-row small, .proactive-feedback-workbench-panel article > header span { color: var(--ak-ink-secondary); }
+.proactive-feedback-workbench-panel button, .proactive-feedback-workbench-panel select { min-height: 44px; }
+.proactive-feedback-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-block: 16px; background: var(--ak-rule-subtle); }
+.proactive-feedback-overview div, .proactive-feedback-overview > p { margin: 0; padding: 14px; background: var(--ak-paper-quiet); }
+.proactive-feedback-overview span { display: block; color: var(--ak-ink-secondary); font-size: 0.78rem; }
+.proactive-feedback-overview strong { display: block; margin-block-start: 4px; }
+.proactive-feedback-toolbar { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+.proactive-feedback-toolbar label { display: grid; gap: 4px; font-size: 0.8rem; }
+.proactive-feedback-toolbar p { color: var(--ak-ink-secondary); }
+.proactive-feedback-panel-grid { display: grid; grid-template-columns: minmax(280px, 0.9fr) minmax(340px, 1.1fr); gap: 24px; margin-block-start: 16px; }
+.proactive-feedback-panel-row { display: grid; width: 100%; gap: 4px; border: 0; border-block-end: 1px solid var(--ak-rule-subtle); padding: 12px; color: inherit; background: transparent; text-align: start; cursor: pointer; }
+@media (hover: hover) { .proactive-feedback-panel-row:hover { background: var(--ak-paper-quiet); } }
+.proactive-feedback-panel-grid footer { display: flex; align-items: center; justify-content: center; gap: 12px; padding-block: 16px; }
+.proactive-feedback-panel-grid > article { min-width: 0; border-inline-start: 1px solid var(--ak-rule-subtle); padding-inline-start: 24px; }
+.proactive-feedback-panel-grid article > header { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.proactive-feedback-panel-grid article > header p { color: var(--ak-ink-secondary); font-size: 0.8rem; }
+.proactive-feedback-detail-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.proactive-feedback-detail-metrics div { padding: 12px; background: var(--ak-paper-quiet); }
+.proactive-feedback-detail-metrics dt { color: var(--ak-ink-secondary); font-size: 0.8rem; }
+.proactive-feedback-detail-metrics dd { margin: 4px 0 0; font-family: ui-monospace, monospace; }
+.proactive-feedback-timeline { display: grid; gap: 10px; margin-block: 18px; }
+.proactive-feedback-step { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 12px; }
+.proactive-feedback-step > span { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid var(--ak-rule-subtle); border-radius: 50%; color: var(--ak-ink-secondary); font-family: ui-monospace, monospace; }
+.proactive-feedback-step h4 { margin-block: 4px; }
+.proactive-feedback-step p { color: var(--ak-ink-secondary); white-space: pre-wrap; }
+.proactive-feedback-step.is-emphasis p { padding: 12px; border-inline-start: 3px solid var(--ak-rule-focus); background: var(--ak-paper-quiet); }
+.proactive-feedback-panel-grid details { border-block-start: 1px solid var(--ak-rule-subtle); padding-block-start: 12px; }
+.proactive-feedback-panel-grid summary { min-height: 44px; cursor: pointer; }
+.proactive-feedback-technical { display: grid; gap: 8px; }
+.proactive-feedback-technical div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; }
+.proactive-feedback-technical dt { color: var(--ak-ink-secondary); font-size: 0.8rem; }
+.proactive-feedback-technical dd { overflow-wrap: anywhere; margin: 0; font-family: ui-monospace, monospace; }
+.proactive-feedback-workbench-panel :focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; }
+@media (max-width: 820px) { .proactive-feedback-workbench-panel > header, .proactive-feedback-toolbar { align-items: start; flex-direction: column; } .proactive-feedback-overview, .proactive-feedback-detail-metrics, .proactive-feedback-panel-grid { grid-template-columns: 1fr; } .proactive-feedback-panel-grid > article { border-inline-start: 0; padding-inline-start: 0; } }
