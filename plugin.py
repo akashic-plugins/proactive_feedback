@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
-from agent.config_models import Config as CoreConfig
 from agent.plugin_composition import (
     Context,
+    EMBEDDINGS,
+    Embeddings,
     MobileUiDefinition,
     MobileUiNavigation,
     MobileUiRpcInvalidRequest,
@@ -20,8 +20,6 @@ from agent.plugin_composition import (
 )
 from agent.turn_events.after_turn import AFTER_TURN_COMMITTED
 from bus.events_lifecycle import TurnCommitted
-from core.net.http import get_default_http_requester
-from memory2.embedder import Embedder
 
 from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
@@ -37,6 +35,7 @@ from .db import (
     pending_feedback_inputs,
 )
 from .scorer import (
+    EmbedBatch,
     MessageRow,
     message_rows_from_snapshot,
     parse_quote_parts,
@@ -61,7 +60,7 @@ name = "proactive_feedback"
 version = "3.0.0"
 desc = "记录主动消息被继续的反馈，并提供桌面与移动只读投影。"
 author = "Akashic"
-inject = (SESSION_READ, UI_SLOTS)
+inject = (SESSION_READ, UI_SLOTS, EMBEDDINGS)
 skill_roots: tuple[str, ...] = ()
 drift_skill_roots: tuple[str, ...] = ()
 workspace_roots: tuple[str, ...] = ()
@@ -75,10 +74,11 @@ async def apply(ctx: Context, config: object) -> None:
     _ = config
     session_read = ctx.require(SESSION_READ)
     ui_slots = ctx.require(UI_SLOTS)
+    embeddings = ctx.require(EMBEDDINGS)
     db_path = ctx.data_root / _FEEDBACK_DB_NAME
     runtime = ProactiveFeedbackRuntime(
         session_read=session_read,
-        workspace=ctx.runtime.workspace,
+        embed_batch=_bind_embeddings(embeddings, ctx),
         db_path=db_path,
     )
     _ = await ctx.provide(
@@ -111,18 +111,17 @@ class ProactiveFeedbackRuntime:
         self,
         *,
         session_read: SessionReadService,
-        workspace: Path,
+        embed_batch: EmbedBatch,
         db_path: Path,
         session_keys: Callable[[], Iterable[str]] | None = None,
     ) -> None:
         self._session_read = session_read
-        self._workspace = workspace
+        self._embed_batch = embed_batch
         self._db_path = db_path
         self._session_keys = session_keys or (
             lambda: _formal_session_keys_from_read_service(session_read)
         )
         self._queue: asyncio.Queue[int] = asyncio.Queue(maxsize=_QUEUE_MAX)
-        self._embedder: Embedder | None = None
         self._discovery_done = False
 
     def observe_committed(self, event: TurnCommitted) -> None:
@@ -270,7 +269,7 @@ class ProactiveFeedbackRuntime:
         # 3. Persist one deduplicated projection, including bounded display text.
         try:
             scored = await score_followup(
-                embed_batch=self._get_embedder().embed_batch if allow_pua else _no_embed,
+                embed_batch=self._embed_batch if allow_pua else _no_embed,
                 user=user,
                 assistant=assistant,
                 candidates=candidates,
@@ -448,11 +447,6 @@ class ProactiveFeedbackRuntime:
             ),
             input_row_id=record.row_id,
         )
-
-    def _get_embedder(self) -> Embedder:
-        if self._embedder is None:
-            self._embedder = _build_embedder(self._workspace)
-        return self._embedder
 
     def _discover_committed_inputs(self) -> None:
         """Discover bounded eligible Turns committed before the callback fanout."""
@@ -687,18 +681,14 @@ def _bounded_session_keys(
     return (*unique[: limit - 1], unique[-1])
 
 
-def _build_embedder(workspace: Path) -> Embedder:
-    config_path = os.environ.get("AKASHIC_CONFIG", "").strip()
-    if not config_path:
-        raise RuntimeError("proactive_feedback 需要 Core 的 AKASHIC_CONFIG")
-    embedding = CoreConfig.load(path=config_path, workspace=workspace).memory.embedding
-    return Embedder(
-        base_url=embedding.base_url,
-        api_key=embedding.api_key,
-        model=embedding.model,
-        output_dimensionality=embedding.output_dimensionality,
-        requester=get_default_http_requester("external_default"),
-    )
+def _bind_embeddings(embeddings: Embeddings, ctx: Context) -> EmbedBatch:
+    async def embed_batch(texts: list[str]) -> list[list[float]]:
+        async with ctx.runtime_scope():
+            async with embeddings.bind() as bound:
+                result = await bound.embed(texts)
+        return [list(vector) for vector in result.vectors]
+
+    return embed_batch
 
 
 def _decode_outbox_payload(payload_json: str) -> dict[str, object]:

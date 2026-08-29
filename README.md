@@ -36,10 +36,9 @@ history reader 始终使用 SQLite `mode=ro`。数据库不存在表示合法空
 若尚无三个 preview 列，history 会把这三个稳定字段投影为 `null` 后参与 canonical hash；
 旧表经既有 `open_db` 逐列 `ALTER` 后形成的 SQLite schema 也属于同一已知 lineage。
 
-非引用评分使用 Core 正式运行时的共享 HTTP resources。嵌入配置从
-`AKASHIC_CONFIG` 指向的 Core 配置加载，不从插件 checkout 的当前目录猜测配置。
-embedding 继续使用既有 Core provider 数据流；API key 只作为运行时认证，不进入
-inbox、projection 或 typed event，完整正文也不进入这些持久/发布边界。
+非引用评分只注入公共 `EMBEDDINGS` service，不读取 Core 配置、provider 或凭据。
+后台评分每次都在当前 generation 的 `runtime_scope` 内执行 `bind → embed`，因此热更新
+前后的任务不会混用模型快照。向量和完整正文不进入 inbox、projection 或 history。
 
 旧 v2 `scripts/backfill_proactive_feedback.py` 已移除：它直接操作
 `workspace/proactive_feedback/proactive_feedback.db`，而 `--clear` 会删除旧 DB、WAL
