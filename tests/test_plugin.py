@@ -5,8 +5,10 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ import pytest
 from agent.plugin_composition import SessionReadService, SessionReadSnapshot
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.dashboard_host import DashboardBinding, PluginDashboardHost
+from agent.plugins.install import install_git_plugin
 from agent.plugins.manager import PluginManager
 from agent.plugins.mobile_ui import PluginMobileUiProvider
 from agent.plugins.manifest import write_plugin_manifest
@@ -45,6 +48,28 @@ def _load_plugin_module():
 
 module = _load_plugin_module()
 FeedbackEvent = module.FeedbackEvent
+
+
+async def _embed_batch(texts: list[str]) -> list[list[float]]:
+    return [[1.0, 0.0] for _ in texts]
+
+
+def _commit_plugin(repo: Path) -> None:
+    for args in (
+        ("init",),
+        ("config", "user.name", "test"),
+        ("config", "user.email", "test@example.com"),
+        ("add", "."),
+        ("commit", "-m", "fixture"),
+    ):
+        result = subprocess.run(
+            ("git", *args),
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
+        assert result.returncode == 0, result.stderr
 
 
 def _event(*, quoted: bool = True) -> TurnCommitted:
@@ -223,43 +248,44 @@ def test_v2_runtime_symbols_are_not_used_by_module() -> None:
     assert "【你当前新消息】" not in source
 
 
-def test_embedder_uses_core_config_and_shared_http_requester(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    config_path = tmp_path / "runtime.toml"
-    requester = object()
-    embedding = SimpleNamespace(
-        base_url="https://embedding.example/v1",
-        api_key="test-key",
-        model="text-embedding-v3",
-        output_dimensionality=1024,
+@pytest.mark.asyncio
+async def test_embedding_service_is_bound_inside_the_generation_scope() -> None:
+    events: list[str] = []
+
+    class Scope:
+        def __init__(self, value: object = None) -> None:
+            self.value = value
+
+        async def __aenter__(self) -> object:
+            events.append("enter")
+            return self.value
+
+        async def __aexit__(self, *_args: object) -> None:
+            events.append("exit")
+
+    class Bound:
+        async def embed(self, texts: list[str]) -> object:
+            events.append("embed")
+            assert texts == ["one", "two"]
+            return SimpleNamespace(vectors=((1.0, 0.0), (0.0, 1.0)))
+
+    class Embeddings:
+        def bind(self) -> Scope:
+            events.append("bind")
+            return Scope(Bound())
+
+    class Context:
+        def runtime_scope(self) -> Scope:
+            events.append("scope")
+            return Scope()
+
+    embed_batch = module._bind_embeddings(
+        cast(Any, Embeddings()),
+        cast(Any, Context()),
     )
-    seen: list[tuple[Path, Path]] = []
 
-    def fake_load(path: str | Path, *, workspace: str | Path) -> object:
-        seen.append((Path(path), Path(workspace)))
-        return SimpleNamespace(memory=SimpleNamespace(embedding=embedding))
-
-    class FakeEmbedder:
-        def __init__(self, **kwargs: object) -> None:
-            self.kwargs = kwargs
-
-    monkeypatch.setenv("AKASHIC_CONFIG", str(config_path))
-    monkeypatch.setattr(module.CoreConfig, "load", fake_load)
-    monkeypatch.setattr(module, "get_default_http_requester", lambda _profile: requester)
-    monkeypatch.setattr(module, "Embedder", FakeEmbedder)
-
-    embedder = module._build_embedder(tmp_path)
-
-    assert seen == [(config_path, tmp_path)]
-    assert embedder.kwargs == {
-        "base_url": embedding.base_url,
-        "api_key": embedding.api_key,
-        "model": embedding.model,
-        "output_dimensionality": embedding.output_dimensionality,
-        "requester": requester,
-    }
+    assert await embed_batch(["one", "two"]) == [[1.0, 0.0], [0.0, 1.0]]
+    assert events == ["scope", "enter", "bind", "enter", "embed", "exit", "exit"]
 
 
 @pytest.mark.asyncio
@@ -268,7 +294,7 @@ async def test_committed_turn_writes_plugin_owned_projection(tmp_path: Path) -> 
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     await runtime._process(_event())
@@ -294,7 +320,7 @@ async def test_feedback_commit_is_readable_from_stable_history(tmp_path: Path) -
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     await runtime._process(_event())
@@ -318,7 +344,7 @@ def test_committed_turn_identity_is_durable_without_message_text(tmp_path: Path)
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     runtime.enqueue(_event())
@@ -347,7 +373,7 @@ def test_candidate_enqueue_fails_before_any_write(tmp_path: Path) -> None:
     db_path = tmp_path / "data" / "proactive_feedback.db"
     runtime = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService.candidate_validation(),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=db_path,
     )
 
@@ -363,14 +389,14 @@ async def test_durable_input_replays_after_runtime_restart(tmp_path: Path) -> No
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     original.enqueue(_event())
 
     restarted = module.ProactiveFeedbackRuntime(
         session_read=original._session_read,
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=original._db_path,
     )
     assert await restarted._process_pending_inputs() is False
@@ -402,14 +428,14 @@ async def test_durable_input_keeps_ordered_two_user_ids_and_scores_one_turn(
     )
     original = module.ProactiveFeedbackRuntime(
         session_read=session_read,
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     original.enqueue(_two_user_event())
 
     restarted = module.ProactiveFeedbackRuntime(
         session_read=session_read,
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=original._db_path,
     )
     assert await restarted._process_pending_inputs() is False
@@ -444,7 +470,7 @@ async def test_formal_boot_discovers_committed_turn_without_callback_once(
     )
     restarted = module.ProactiveFeedbackRuntime(
         session_read=session_read,
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
         session_keys=lambda: ("mobile:test",),
     )
@@ -501,7 +527,7 @@ def test_formal_boot_prioritizes_new_session_over_old_catalog_window(
 
     runtime = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService(lookup),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=db_path,
         session_keys=lambda: (*old_keys, new_key),
     )
@@ -560,7 +586,7 @@ def test_formal_boot_rotates_turns_across_sessions_with_pending_history(
     monkeypatch.setattr(module, "insert_feedback_input", track_insert)
     runtime = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService(lookup),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=db_path,
         session_keys=lambda: (*old_keys, new_key),
     )
@@ -599,7 +625,7 @@ async def test_durable_input_cancellation_keeps_pending_row(
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     runtime.enqueue(_event())
@@ -691,7 +717,7 @@ async def test_candidate_session_read_fails_before_any_write(tmp_path: Path) -> 
     db_path = tmp_path / "data" / "proactive_feedback.db"
     runtime = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService.candidate_validation(),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=db_path,
     )
     with pytest.raises(RuntimeError, match="禁止读取正式 Session"):
@@ -701,23 +727,16 @@ async def test_candidate_session_read_fails_before_any_write(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_nonquoted_turn_keeps_pua_scoring_path(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state(quoted=False)), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
 
-    class EmbedderStub:
-        async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-            assert len(texts) == 3
-            return [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]
-
-    monkeypatch.setattr(runtime, "_get_embedder", lambda: EmbedderStub())
     await runtime._process(_event(quoted=False))
     conn = sqlite3.connect(runtime._db_path)
     try:
@@ -738,7 +757,7 @@ async def test_scoring_failure_records_unscored_feedback(
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
 
@@ -766,7 +785,7 @@ async def test_in_process_cancellation_does_not_persist_partial_feedback(
         session_read=SessionReadService(
             lambda _key: (cast(Any, _session_state()), None)
         ),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     started = asyncio.Event()
@@ -788,7 +807,7 @@ async def test_in_process_cancellation_does_not_persist_partial_feedback(
 async def test_worker_cancellation_has_no_live_task(tmp_path: Path) -> None:
     runtime = module.ProactiveFeedbackRuntime(
         session_read=SessionReadService.candidate_validation(),
-        workspace=tmp_path,
+        embed_batch=_embed_batch,
         db_path=tmp_path / "data" / "proactive_feedback.db",
     )
     task = asyncio.create_task(runtime.run_worker())
@@ -1075,7 +1094,7 @@ def test_plugin_runtime_does_not_move_legacy_database(tmp_path: Path) -> None:
     target_root = tmp_path / "plugin-data"
     runtime = module.ProactiveFeedbackRuntime(
         session_read=cast(Any, object()),
-        workspace=tmp_path / "workspace",
+        embed_batch=_embed_batch,
         db_path=target_root / "proactive_feedback.db",
     )
 
@@ -1085,8 +1104,55 @@ def test_plugin_runtime_does_not_move_legacy_database(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_plugin_installs_and_loads_from_ordinary_cache(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for path in Path(__file__).parents[1].iterdir():
+        if path.is_file() and path.name != ".git":
+            shutil.copy2(path, source / path.name)
+    _commit_plugin(source)
+    workspace = tmp_path / "workspace"
+    plugin_home = tmp_path / "home"
+    installed = install_git_plugin(
+        workspace=workspace,
+        source=str(source),
+        marketplace="ordinary-test",
+        plugins_home=plugin_home,
+    )
+    core_plugins = Path(inspect.getfile(PluginManager)).parents[2] / "plugins"
+    manager = PluginManager(
+        plugin_dirs=[
+            core_plugins / "models",
+            core_plugins / "openai_compatible",
+        ],
+        event_bus=EventBus(),
+        tool_registry=None,
+        session_manager=_empty_session_manager(),
+        workspace=workspace,
+        installed_cache_root=plugin_home / "cache",
+    )
+    try:
+        await manager.load_all()
+        generation = manager.generation("proactive_feedback@ordinary-test")
+        assert generation is not None
+        assert generation.source_type == "installed"
+        assert generation.plugin_dir == installed.installed_path
+        instance = cast(ComposablePlugin, generation.instance)
+        assert instance.module.__file__ is not None
+        assert Path(instance.module.__file__).resolve().is_relative_to(
+            installed.installed_path
+        )
+        assert manager.current_snapshot is not None
+        assert manager.current_snapshot.composition_root is not None
+        assert manager.current_snapshot.composition_root.receipt().ready
+    finally:
+        await manager.terminate_all()
+
+
+@pytest.mark.asyncio
 async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path) -> None:
     plugin_dir = tmp_path / "plugins" / "proactive_feedback"
+    core_plugins = Path(inspect.getfile(PluginManager)).parents[2] / "plugins"
     plugin_dir.mkdir(parents=True)
     for filename in (
         "plugin.py",
@@ -1104,7 +1170,11 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         plugins_home=tmp_path / "home",
     )
     manager = PluginManager(
-        plugin_dirs=[tmp_path / "plugins"],
+        plugin_dirs=[
+            tmp_path / "plugins",
+            core_plugins / "models",
+            core_plugins / "openai_compatible",
+        ],
         event_bus=EventBus(),
         tool_registry=None,
         session_manager=_empty_session_manager(),
