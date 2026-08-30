@@ -1,189 +1,190 @@
-export function activate(ctx) {
-  return ctx.ui.inject("workbench.panels.v1", (mount) => mount.register({
-    id: "proactive-feedback",
-    label: "主动反馈",
-    order: 50,
-    render(host) {
-      const panel = document.createElement("section");
-      panel.className = "proactive-feedback-workbench-panel";
-      panel.innerHTML = `<header><div><h1>主动反馈</h1><p>查看主动消息是否被继续，以及对应的回应链路。</p></div><button type="button" data-refresh>刷新</button></header><section class="proactive-feedback-overview" data-overview aria-label="反馈总览"><p>正在读取反馈总览…</p></section><div class="proactive-feedback-toolbar"><label>反馈类型<select data-filter><option value="">全部</option><option value="topic_follow">话题延续</option><option value="explicit_quote">明确引用</option><option value="no_topic_follow">未延续话题</option><option value="unscored">待评分</option></select></label><p data-status role="status" aria-live="polite"></p></div><div class="proactive-feedback-panel-grid"><div><div data-list></div><footer><button type="button" data-previous>上一页</button><span data-page></span><button type="button" data-next>下一页</button></footer></div><article data-detail><p>选择一条反馈查看完整回应链路。</p></article></div>`;
-      host.replaceChildren(panel);
-      const overview = panel.querySelector("[data-overview]");
-      const refresh = panel.querySelector("[data-refresh]");
-      const filter = panel.querySelector("[data-filter]");
-      const status = panel.querySelector("[data-status]");
-      const list = panel.querySelector("[data-list]");
-      const detail = panel.querySelector("[data-detail]");
-      const pageText = panel.querySelector("[data-page]");
-      const previous = panel.querySelector("[data-previous]");
-      const next = panel.querySelector("[data-next]");
-      let page = 1;
-      let total = 0;
-      let disposed = false;
-      let overviewRequest = new AbortController();
-      let listRequest = new AbortController();
-      let detailRequest = new AbortController();
-
-      const loadOverview = async () => {
-        overviewRequest.abort();
-        overviewRequest = new AbortController();
-        const request = overviewRequest;
-        overview.textContent = "正在读取反馈总览…";
-        try {
-          const data = await json(ctx, "/api/dashboard/proactive-feedback/overview", request.signal);
-          if (disposed || request.signal.aborted) return;
-          overview.innerHTML = renderOverview(data);
-        } catch (reason) {
-          if (!disposed && !request.signal.aborted) showError(overview, reason);
-        }
-      };
-
-      const loadList = async () => {
-        listRequest.abort();
-        listRequest = new AbortController();
-        const request = listRequest;
-        const requestedPage = page;
-        const params = new URLSearchParams({page: String(requestedPage), page_size: "25"});
-        if (filter.value) params.set("feedback_type", filter.value);
-        status.textContent = "正在读取反馈记录…";
-        try {
-          const data = await json(ctx, `/api/dashboard/proactive-feedback/events?${params}`, request.signal);
-          if (disposed || request.signal.aborted) return;
-          total = finiteNumber(data.total);
-          renderRows(list, data.items, openDetail);
-          const pages = Math.max(1, Math.ceil(total / 25));
-          pageText.textContent = `${requestedPage} / ${pages}`;
-          previous.disabled = requestedPage <= 1;
-          next.disabled = requestedPage >= pages;
-          status.textContent = total ? `共 ${total} 条反馈` : "没有符合条件的反馈。";
-        } catch (reason) {
-          if (!disposed && !request.signal.aborted) showError(status, reason);
-        }
-      };
-
-      const openDetail = async (eventId) => {
-        detailRequest.abort();
-        detailRequest = new AbortController();
-        const request = detailRequest;
-        detail.innerHTML = "<p>正在读取详情…</p>";
-        try {
-          const item = await json(ctx, `/api/dashboard/proactive-feedback/events/${encodeURIComponent(eventId)}`, request.signal);
-          if (disposed || request.signal.aborted) return;
-          detail.innerHTML = renderDetail(item);
-        } catch (reason) {
-          if (!disposed && !request.signal.aborted) showError(detail, reason);
-        }
-      };
-
-      refresh.addEventListener("click", () => {
-        void loadOverview();
-        void loadList();
-      });
-      filter.addEventListener("change", () => {
-        page = 1;
-        void loadList();
-      });
-      previous.addEventListener("click", () => {
-        if (page > 1) {
-          page -= 1;
-          void loadList();
-        }
-      });
-      next.addEventListener("click", () => {
-        if (page * 25 < total) {
-          page += 1;
-          void loadList();
-        }
-      });
-      void loadOverview();
-      void loadList();
-      return () => {
-        disposed = true;
-        overviewRequest.abort();
-        listRequest.abort();
-        detailRequest.abort();
-        host.replaceChildren();
-      };
-    },
-  }));
-}
-
-function renderOverview(data) {
-  return `<div><span>总反馈</span><strong>${finiteNumber(data && data.total)}</strong></div><div><span>话题延续率</span><strong>${percent(data && data.follow_rate)}</strong></div><div><span>明确引用</span><strong>${finiteNumber(data && data.explicit_quote)}</strong></div><div><span>高置信度</span><strong>${finiteNumber(data && data.high_confidence)}</strong></div>`;
-}
-
-function renderRows(target, items, openDetail) {
-  target.replaceChildren();
-  if (!Array.isArray(items) || !items.length) {
-    target.innerHTML = "<p>没有可展示的反馈记录。</p>";
-    return;
-  }
-  for (const item of items) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "proactive-feedback-panel-row";
-    button.innerHTML = `<strong>${escapeHtml(feedbackLabel(item.feedback_type))}</strong><span>${escapeHtml(shortTime(item.created_at))} · ${escapeHtml(confidenceLabel(item.confidence))} · ${escapeHtml(lagText(item.lag_seconds))}</span><small>${escapeHtml(String(item.user_reply_preview || item.user_preview || "没有可展示的用户反馈"))}</small>`;
-    button.addEventListener("click", () => void openDetail(item.id));
-    target.append(button);
-  }
-}
-
-function renderDetail(item) {
-  return `<header><div><p>主动消息效果</p><h2>用户如何回应这次主动触达</h2><span>${escapeHtml(String(item.session_key || "未关联会话"))}</span></div><strong>${escapeHtml(feedbackLabel(item.feedback_type))}</strong></header><dl class="proactive-feedback-detail-metrics"><div><dt>置信度</dt><dd>${escapeHtml(confidenceLabel(item.confidence))}</dd></div><div><dt>响应延迟</dt><dd>${escapeHtml(lagText(item.lag_seconds))}</dd></div><div><dt>PUA 分数</dt><dd>${escapeHtml(score(item.pua_score))}</dd></div></dl><section class="proactive-feedback-timeline"><h3>对话链路</h3>${timelineStep("1", "主动消息", item.proactive_preview || item.quoted_preview)}${timelineStep("2", "用户反馈", item.user_reply_preview || item.user_preview, true)}${timelineStep("3", "助手后续", item.assistant_preview)}</section><details><summary>查看匹配依据与消息标识</summary><dl class="proactive-feedback-technical"><div><dt>匹配方式</dt><dd>${escapeHtml(String(item.matched_by || "-"))}</dd></div><div><dt>用户消息 ID</dt><dd>${escapeHtml(String(item.user_message_id || "-"))}</dd></div><div><dt>主动消息 ID</dt><dd>${escapeHtml(String(item.proactive_message_id || "-"))}</dd></div></dl></details>`;
-}
-
-function timelineStep(index, title, text, emphasis = false) {
-  return `<div class="proactive-feedback-step${emphasis ? " is-emphasis" : ""}"><span>${index}</span><div><h4>${title}</h4><p>${escapeHtml(String(text || "没有可展示的内容"))}</p></div></div>`;
-}
-
-async function json(ctx, path, signal) {
-  const response = await ctx.http.request(path, {method: "GET", signal});
+// dashboard_panel.tsx
+import { Chip, chipClass } from "@akashic/dashboard-ui";
+import { jsx, jsxs } from "react/jsx-runtime";
+var dashboardRequest = null;
+async function api(path, init) {
+  if (!dashboardRequest) throw new Error("\u4E3B\u52A8\u53CD\u9988\u5DE5\u4F5C\u53F0\u9762\u677F\u672A\u6FC0\u6D3B");
+  const response = await dashboardRequest(path, init);
   const body = await response.json();
-  if (!response.ok) throw new Error(body?.detail || body?.message || `HTTP ${response.status}`);
+  if (!response.ok) throw new Error(String(body.detail ?? body.message ?? `HTTP ${response.status}`));
   return body;
 }
-
-function feedbackLabel(value) {
-  return ({explicit_quote: "明确引用", topic_follow: "话题延续", no_topic_follow: "未延续话题", unscored: "待评分"})[value] || String(value || "-");
+function _score(value) {
+  return typeof value === "number" ? value.toFixed(3) : "-";
 }
-
-function confidenceLabel(value) {
-  return ({gold: "金标", high: "高", medium: "中", low: "低"})[value] || String(value || "-");
+function _shortTs(value) {
+  const text = String(value || "");
+  if (!text) return "-";
+  const d = new Date(text);
+  if (Number.isNaN(d.getTime())) return text;
+  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
-
-function score(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number.toFixed(3) : "-";
+function _lag(value) {
+  if (typeof value !== "number") return "-";
+  if (value < 60) return `${value}s`;
+  if (value < 3600) return `${Math.round(value / 60)}m`;
+  return `${(value / 3600).toFixed(1)}h`;
 }
-
-function lagText(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  if (number < 60) return `${number}s`;
-  if (number < 3600) return `${Math.round(number / 60)}m`;
-  return `${(number / 3600).toFixed(1)}h`;
+function _tone(type) {
+  if (type === "explicit_quote") return "accent";
+  if (type === "topic_follow") return "success";
+  if (type === "unscored") return "warning";
+  if (type === "no_topic_follow") return "muted";
+  return "muted";
 }
-
-function percent(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? `${Math.round(number * 100)}%` : "-";
+function _feedbackTypeLabel(value) {
+  const type = String(value || "");
+  if (type === "explicit_quote") return "\u660E\u786E\u5F15\u7528";
+  if (type === "topic_follow") return "\u8BDD\u9898\u5EF6\u7EED";
+  if (type === "no_topic_follow") return "\u672A\u5EF6\u7EED\u8BDD\u9898";
+  if (type === "unscored") return "\u5F85\u8BC4\u5206";
+  return type || "-";
 }
-
-function finiteNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : 0;
+function _confidenceLabel(value) {
+  const confidence = String(value || "");
+  if (confidence === "gold") return "\u91D1\u6807";
+  if (confidence === "high") return "\u9AD8";
+  if (confidence === "medium") return "\u4E2D";
+  if (confidence === "low") return "\u4F4E";
+  return confidence || "-";
 }
-
-function shortTime(value) {
-  const date = new Date(String(value || ""));
-  return Number.isNaN(date.getTime()) ? "-" : new Intl.DateTimeFormat("zh-CN", {month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false}).format(date);
+function _escape(value) {
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
-
-function showError(target, reason) {
-  target.setAttribute("role", "alert");
-  target.textContent = reason instanceof Error ? reason.message : String(reason);
+function _cellText(value) {
+  const text = String(value || "").trim();
+  return _escape(text || "-");
 }
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (character) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[character]);
+function _typeCell(value) {
+  const type = String(value || "");
+  const tone = type === "explicit_quote" ? "accent" : type === "topic_follow" ? "success" : type === "unscored" ? "warning" : "muted";
+  return `<span class="${chipClass(tone)}">${_escape(_feedbackTypeLabel(type))}</span>`;
 }
+function _confidenceTone(value) {
+  const confidence = String(value || "");
+  if (confidence === "gold" || confidence === "high") return "success";
+  if (confidence === "medium") return "warning";
+  return "muted";
+}
+function _confidenceCell(value) {
+  const confidence = String(value || "-");
+  return `<span class="${chipClass(_confidenceTone(confidence))}">${_escape(_confidenceLabel(confidence))}</span>`;
+}
+function FeedbackDetail(props) {
+  const item = props.item;
+  if (!item) {
+    return /* @__PURE__ */ jsxs("div", { className: "feedback-empty", children: [
+      /* @__PURE__ */ jsx("div", { className: "feedback-empty__title", children: "\u53CD\u9988\u8BE6\u60C5" }),
+      /* @__PURE__ */ jsx("div", { className: "feedback-empty__text", children: "\u70B9\u5F00\u4E00\u6761\u8BB0\u5F55\u540E\uFF0C\u8FD9\u91CC\u4F1A\u663E\u793A\u7528\u6237\u56DE\u590D\u3001\u547D\u4E2D\u7684 proactive \u548C\u52A9\u624B\u540E\u7EED\u56DE\u590D\u3002" })
+    ] });
+  }
+  const type = String(item.feedback_type || "");
+  return /* @__PURE__ */ jsxs("main", { className: "feedback-detail", "aria-labelledby": "feedback-detail-title", children: [
+    /* @__PURE__ */ jsxs("header", { className: "feedback-detail__header", children: [
+      /* @__PURE__ */ jsxs("div", { children: [
+        /* @__PURE__ */ jsx("p", { children: "\u4E3B\u52A8\u6D88\u606F\u6548\u679C" }),
+        /* @__PURE__ */ jsx("h2", { id: "feedback-detail-title", children: "\u7528\u6237\u5982\u4F55\u56DE\u5E94\u8FD9\u6B21\u4E3B\u52A8\u89E6\u8FBE" }),
+        /* @__PURE__ */ jsx("span", { children: String(item.session_key || "\u672A\u5173\u8054\u4F1A\u8BDD") })
+      ] }),
+      /* @__PURE__ */ jsx(Chip, { tone: _tone(type), children: _feedbackTypeLabel(type) })
+    ] }),
+    /* @__PURE__ */ jsxs("section", { className: "feedback-summary", "aria-label": "\u53CD\u9988\u5224\u65AD\u6458\u8981", children: [
+      /* @__PURE__ */ jsx(SummaryMetric, { label: "\u7F6E\u4FE1\u5EA6", value: _confidenceLabel(item.confidence) }),
+      /* @__PURE__ */ jsx(SummaryMetric, { label: "\u54CD\u5E94\u5EF6\u8FDF", value: _lag(item.lag_seconds) }),
+      /* @__PURE__ */ jsx(SummaryMetric, { label: "PUA \u5206\u6570", value: _score(item.pua_score) })
+    ] }),
+    /* @__PURE__ */ jsxs("section", { className: "feedback-timeline", "aria-labelledby": "feedback-timeline-title", children: [
+      /* @__PURE__ */ jsx("h3", { id: "feedback-timeline-title", children: "\u5BF9\u8BDD\u94FE\u8DEF" }),
+      /* @__PURE__ */ jsx(TimelineStep, { index: "1", title: "\u4E3B\u52A8\u6D88\u606F", text: String(item.proactive_preview || item.quoted_preview || "") }),
+      /* @__PURE__ */ jsx(TimelineStep, { index: "2", title: "\u7528\u6237\u53CD\u9988", text: String(item.user_reply_preview || item.user_preview || ""), emphasis: true }),
+      /* @__PURE__ */ jsx(TimelineStep, { index: "3", title: "\u52A9\u624B\u540E\u7EED", text: String(item.assistant_preview || "") })
+    ] }),
+    /* @__PURE__ */ jsxs("details", { className: "feedback-technical", children: [
+      /* @__PURE__ */ jsx("summary", { children: "\u67E5\u770B\u5339\u914D\u4F9D\u636E\u4E0E\u6D88\u606F\u6807\u8BC6" }),
+      /* @__PURE__ */ jsxs("dl", { children: [
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("dt", { children: "\u5339\u914D\u65B9\u5F0F" }),
+          /* @__PURE__ */ jsx("dd", { children: String(item.matched_by || "-") })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("dt", { children: "\u7528\u6237\u6D88\u606F ID" }),
+          /* @__PURE__ */ jsx("dd", { children: String(item.user_message_id || "-") })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("dt", { children: "\u4E3B\u52A8\u6D88\u606F ID" }),
+          /* @__PURE__ */ jsx("dd", { children: String(item.proactive_message_id || "-") })
+        ] })
+      ] })
+    ] })
+  ] });
+}
+function SummaryMetric(props) {
+  return /* @__PURE__ */ jsxs("div", { children: [
+    /* @__PURE__ */ jsx("span", { children: props.label }),
+    /* @__PURE__ */ jsx("strong", { children: props.value })
+  ] });
+}
+function TimelineStep(props) {
+  return /* @__PURE__ */ jsxs("div", { className: `feedback-step${props.emphasis ? " is-emphasis" : ""}`, children: [
+    /* @__PURE__ */ jsx("span", { className: "feedback-step__index", children: props.index }),
+    /* @__PURE__ */ jsxs("div", { children: [
+      /* @__PURE__ */ jsx("h4", { children: props.title }),
+      /* @__PURE__ */ jsx("p", { children: props.text || "\u6CA1\u6709\u53EF\u5C55\u793A\u7684\u5185\u5BB9" })
+    ] })
+  ] });
+}
+var panel = {
+  id: "proactive-feedback",
+  label: "\u4E3B\u52A8\u53CD\u9988",
+  viewLabel: "\u4E3B\u52A8\u53CD\u9988",
+  order: 70,
+  pageSize: 50,
+  rowKey: "id",
+  countTitle(total) {
+    return `\u5171 ${total} \u6761\u53CD\u9988`;
+  },
+  columns: [
+    { key: "created_at", label: "\u65F6\u95F4", width: 96, fmt: "mono-time", cellClass: "mono cell-time", rawTitle: true },
+    { key: "feedback_type", label: "\u7C7B\u578B", width: 126, renderCell: _typeCell },
+    { key: "confidence", label: "\u7F6E\u4FE1\u5EA6", width: 84, renderCell: _confidenceCell },
+    { key: "lag_seconds", label: "\u5EF6\u8FDF", width: 68, fmt: "lag", cellClass: "mono cell-metric", align: "right" },
+    { key: "user_reply_preview", label: "\u7528\u6237\u56DE\u590D", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
+    { key: "proactive_preview", label: "\u547D\u4E2D\u5185\u5BB9", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true }
+  ],
+  async getCount({ signal }) {
+    try {
+      const overview = await api("/api/dashboard/proactive-feedback/overview", { signal });
+      return overview.total || 0;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      return null;
+    }
+  },
+  async fetchPage({ page, pageSize, signal }) {
+    const params = new URLSearchParams();
+    params.set("page", String(page));
+    params.set("page_size", String(pageSize));
+    const data = await api(`/api/dashboard/proactive-feedback/events?${params.toString()}`, { signal });
+    return { items: data.items || [], total: data.total || 0 };
+  },
+  async fetchDetail(item, { signal }) {
+    return api(`/api/dashboard/proactive-feedback/events/${item.id}`, { signal });
+  },
+  Detail: FeedbackDetail,
+  formatters: {
+    score: (value) => _score(value),
+    lag: (value) => _lag(value),
+    "mono-time": (value) => _shortTs(value)
+  }
+};
+function activate(ctx) {
+  dashboardRequest = ctx.http.request;
+  const release = ctx.ui.inject("workbench.panels.v2", (mount) => mount.register(panel));
+  return () => {
+    release();
+    dashboardRequest = null;
+  };
+}
+export {
+  activate
+};
