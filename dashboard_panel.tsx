@@ -1,8 +1,8 @@
 import { type ReactElement } from "react";
-import { Chip, chipClass } from "@akashic/dashboard-ui";
+import { createRoot } from "react-dom/client";
 import "./dashboard_panel.css";
 import type { WebHostContextV1, WebUiDisposer } from "@akashic/web-ui-v1";
-import type { WorkbenchPanelEntry } from "@akashic/workbench-ui-v2";
+import type { WorkbenchDispatch, WorkbenchPanelEntry, WorkbenchUi } from "@akashic/workbench-ui-v2";
 
 let dashboardRequest: WebHostContextV1["http"]["request"] | null = null;
 
@@ -85,7 +85,7 @@ function _cellText(value: unknown): string {
 function _typeCell(value: unknown): string {
   const type = String(value || "");
   const tone = type === "explicit_quote" ? "accent" : type === "topic_follow" ? "success" : type === "unscored" ? "warning" : "muted";
-  return `<span class="${chipClass(tone)}">${_escape(_feedbackTypeLabel(type))}</span>`;
+  return `<span class="ak-chip ak-chip--${tone} inline-flex items-center gap-1.5 px-2.5 py-1 font-sans text-[11px] tabular-nums">${_escape(_feedbackTypeLabel(type))}</span>`;
 }
 
 function _confidenceTone(value: unknown): "success" | "warning" | "muted" {
@@ -97,11 +97,13 @@ function _confidenceTone(value: unknown): "success" | "warning" | "muted" {
 
 function _confidenceCell(value: unknown): string {
   const confidence = String(value || "-");
-  return `<span class="${chipClass(_confidenceTone(confidence))}">${_escape(_confidenceLabel(confidence))}</span>`;
+  const tone = _confidenceTone(confidence);
+  return `<span class="ak-chip ak-chip--${tone} inline-flex items-center gap-1.5 px-2.5 py-1 font-sans text-[11px] tabular-nums">${_escape(_confidenceLabel(confidence))}</span>`;
 }
 
-function FeedbackDetail(props: { item: Record<string, unknown> | null }): ReactElement {
+function FeedbackDetail(props: { item: Record<string, unknown> | null; ui: WorkbenchUi }): ReactElement {
   const item = props.item;
+  const Chip = props.ui.Chip;
   if (!item) {
     return <div className="feedback-empty"><div className="feedback-empty__title">反馈详情</div><div className="feedback-empty__text">点开一条记录后，这里会显示用户回复、命中的 proactive 和助手后续回复。</div></div>;
   }
@@ -201,7 +203,11 @@ const panel = {
     return api<Record<string, unknown>>(`/api/dashboard/proactive-feedback/events/${item.id}`, { signal });
   },
 
-  Detail: FeedbackDetail,
+  renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch: WorkbenchDispatch): WebUiDisposer {
+    const root = createRoot(container);
+    root.render(<FeedbackDetail item={item} ui={dispatch.ui} />);
+    return () => root.unmount();
+  },
 
   formatters: {
     score: (value: unknown) => _score(value),
