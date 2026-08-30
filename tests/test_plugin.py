@@ -1240,9 +1240,9 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         binding = next(
             item
             for item in candidate_snapshot.dashboard_bindings
-            if item.plugin_id == "proactive_feedback"
+            if isinstance(item, DashboardBinding)
+            and item.plugin_id == "proactive_feedback"
         )
-        assert isinstance(binding, DashboardBinding)
         assert binding.validation is True
         assert binding.runtime_data_root is not None
         assert binding.runtime_data_root != formal_data.resolve()
