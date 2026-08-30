@@ -1,6 +1,6 @@
 schema_version = 1
 name = "proactive_feedback"
-version = "3.0.0"
+version = "3.0.1"
 api_version = 3
 entrypoint = "plugin.py"
 

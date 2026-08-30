@@ -1122,8 +1122,10 @@ async def test_plugin_installs_and_loads_from_ordinary_cache(tmp_path: Path) -> 
     core_plugins = Path(inspect.getfile(PluginManager)).parents[2] / "plugins"
     manager = PluginManager(
         plugin_dirs=[
+            core_plugins / "shell_ui",
             core_plugins / "models",
             core_plugins / "openai_compatible",
+            core_plugins / "workbench_ui",
         ],
         event_bus=EventBus(),
         tool_registry=None,
@@ -1162,6 +1164,8 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         "scorer.py",
         "mobile_panel.js",
         "mobile_panel.css",
+        "web_module.js",
+        "web_module.css",
         "akashic.plugin.toml",
     ):
         shutil.copy2(Path(__file__).parents[1] / filename, plugin_dir / filename)
@@ -1172,8 +1176,10 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
     manager = PluginManager(
         plugin_dirs=[
             tmp_path / "plugins",
+            core_plugins / "shell_ui",
             core_plugins / "models",
             core_plugins / "openai_compatible",
+            core_plugins / "workbench_ui",
         ],
         event_bus=EventBus(),
         tool_registry=None,
@@ -1231,9 +1237,12 @@ async def test_manager_stable_candidate_ui_dashboard_and_cleanup(tmp_path: Path)
         candidate_snapshot = candidate.runtime_snapshot
         assert candidate_snapshot.mobile_ui_registry is not None
         dashboard_host.prepare_snapshot(candidate_snapshot)
-        assert len(candidate_snapshot.dashboard_bindings) == 1
-        binding = candidate_snapshot.dashboard_bindings[0]
-        assert isinstance(binding, DashboardBinding)
+        binding = next(
+            item
+            for item in candidate_snapshot.dashboard_bindings
+            if isinstance(item, DashboardBinding)
+            and item.plugin_id == "proactive_feedback"
+        )
         assert binding.validation is True
         assert binding.runtime_data_root is not None
         assert binding.runtime_data_root != formal_data.resolve()

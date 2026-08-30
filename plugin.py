@@ -57,7 +57,7 @@ _DISCOVERY_TURN_LIMIT = 256
 
 api_version = 3
 name = "proactive_feedback"
-version = "3.0.0"
+version = "3.0.1"
 desc = "记录主动消息被继续的反馈，并提供桌面与移动只读投影。"
 author = "Akashic"
 inject = (SESSION_READ, UI_SLOTS, EMBEDDINGS)
@@ -65,6 +65,12 @@ skill_roots: tuple[str, ...] = ()
 drift_skill_roots: tuple[str, ...] = ()
 workspace_roots: tuple[str, ...] = ()
 dashboard_module = "dashboard.py"
+web_module = "web_module.js"
+web_requires = ("workbench.panels.v2",)
+web_provides = ()
+web_contract_digests = {
+    "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
+}
 
 
 async def apply(ctx: Context, config: object) -> None:

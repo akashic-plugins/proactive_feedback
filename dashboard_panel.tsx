@@ -1,6 +1,18 @@
-/// <reference path="../../types/akashic-dashboard.d.ts" />
 import { type ReactElement } from "react";
-import { Chip, api } from "@akashic/dashboard-ui";
+import { createRoot } from "react-dom/client";
+import "./dashboard_panel.css";
+import type { WebHostContextV1, WebUiDisposer } from "@akashic/web-ui-v1";
+import type { WorkbenchDispatch, WorkbenchPanelEntry, WorkbenchUi } from "@akashic/workbench-ui-v2";
+
+let dashboardRequest: WebHostContextV1["http"]["request"] | null = null;
+
+async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  if (!dashboardRequest) throw new Error("主动反馈工作台面板未激活");
+  const response = await dashboardRequest(path, init);
+  const body = await response.json() as T & { detail?: unknown; message?: unknown };
+  if (!response.ok) throw new Error(String(body.detail ?? body.message ?? `HTTP ${response.status}`));
+  return body;
+}
 
 interface Overview {
   total: number;
@@ -73,7 +85,7 @@ function _cellText(value: unknown): string {
 function _typeCell(value: unknown): string {
   const type = String(value || "");
   const tone = type === "explicit_quote" ? "accent" : type === "topic_follow" ? "success" : type === "unscored" ? "warning" : "muted";
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(tone)}">${_escape(_feedbackTypeLabel(type))}</span>`;
+  return `<span class="ak-chip ak-chip--${tone} inline-flex items-center gap-1.5 px-2.5 py-1 font-sans text-[11px] tabular-nums">${_escape(_feedbackTypeLabel(type))}</span>`;
 }
 
 function _confidenceTone(value: unknown): "success" | "warning" | "muted" {
@@ -85,13 +97,15 @@ function _confidenceTone(value: unknown): "success" | "warning" | "muted" {
 
 function _confidenceCell(value: unknown): string {
   const confidence = String(value || "-");
-  return `<span class="${window.AkashicDashboard.ui.cx.badge(_confidenceTone(confidence))}">${_escape(_confidenceLabel(confidence))}</span>`;
+  const tone = _confidenceTone(confidence);
+  return `<span class="ak-chip ak-chip--${tone} inline-flex items-center gap-1.5 px-2.5 py-1 font-sans text-[11px] tabular-nums">${_escape(_confidenceLabel(confidence))}</span>`;
 }
 
-function FeedbackDetail(props: { item: Record<string, unknown> | null }): ReactElement {
+function FeedbackDetail(props: { item: Record<string, unknown> | null; ui: WorkbenchUi }): ReactElement {
   const item = props.item;
+  const Chip = props.ui.Chip;
   if (!item) {
-    return <div className="detail-empty"><div className="detail-empty-title">反馈详情</div><div className="detail-empty-text">点开一条记录后，这里会显示用户回复、命中的 proactive 和助手后续回复。</div></div>;
+    return <div className="feedback-empty"><div className="feedback-empty__title">反馈详情</div><div className="feedback-empty__text">点开一条记录后，这里会显示用户回复、命中的 proactive 和助手后续回复。</div></div>;
   }
   const type = String(item.feedback_type || "");
   return (
@@ -146,10 +160,11 @@ function TimelineStep(props: { index: string; title: string; text: string; empha
   );
 }
 
-window.AkashicDashboard.registerPlugin({
-  id: "proactive_feedback",
+const panel = {
+  id: "proactive-feedback",
   label: "主动反馈",
   viewLabel: "主动反馈",
+  order: 70,
   pageSize: 50,
   rowKey: "id",
 
@@ -166,32 +181,46 @@ window.AkashicDashboard.registerPlugin({
     { key: "proactive_preview", label: "命中内容", flex: true, renderCell: _cellText, cellClass: "content-preview", rawTitle: true },
   ],
 
-  async getCount(): Promise<number | null> {
+  async getCount({ signal }: { signal: AbortSignal }): Promise<number | null> {
     try {
-      const overview = await api<Overview>("/api/dashboard/proactive-feedback/overview");
+      const overview = await api<Overview>("/api/dashboard/proactive-feedback/overview", { signal });
       return overview.total || 0;
-    } catch {
+    } catch (error) {
+      if (signal.aborted) throw error;
       return null;
     }
   },
 
-  async fetchPage({ page, pageSize }: { page: number; pageSize: number }) {
+  async fetchPage({ page, pageSize, signal }: { page: number; pageSize: number; signal: AbortSignal }) {
     const params = new URLSearchParams();
     params.set("page", String(page));
     params.set("page_size", String(pageSize));
-    const data = await api<FetchPage>(`/api/dashboard/proactive-feedback/events?${params.toString()}`);
+    const data = await api<FetchPage>(`/api/dashboard/proactive-feedback/events?${params.toString()}`, { signal });
     return { items: data.items || [], total: data.total || 0 };
   },
 
-  async fetchDetail(item: Record<string, unknown>) {
-    return api<Record<string, unknown>>(`/api/dashboard/proactive-feedback/events/${item.id}`);
+  async fetchDetail(item: Record<string, unknown>, { signal }: { signal: AbortSignal }) {
+    return api<Record<string, unknown>>(`/api/dashboard/proactive-feedback/events/${item.id}`, { signal });
   },
 
-  Detail: FeedbackDetail,
+  renderDetail(item: Record<string, unknown> | null, container: HTMLElement, dispatch: WorkbenchDispatch): WebUiDisposer {
+    const root = createRoot(container);
+    root.render(<FeedbackDetail item={item} ui={dispatch.ui} />);
+    return () => root.unmount();
+  },
 
   formatters: {
     score: (value: unknown) => _score(value),
     lag: (value: unknown) => _lag(value),
     "mono-time": (value: unknown) => _shortTs(value),
   },
-});
+} satisfies WorkbenchPanelEntry;
+
+export function activate(ctx: WebHostContextV1): WebUiDisposer {
+  dashboardRequest = ctx.http.request;
+  const release = ctx.ui.inject("workbench.panels.v2", (mount) => mount.register(panel));
+  return () => {
+    release();
+    dashboardRequest = null;
+  };
+}
