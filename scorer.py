@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import json
 import math
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from collections.abc import Mapping, Sequence
 from typing import Protocol
+
+from session.message import ContentPart, Input, Message, Output
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,9 @@ class MessageRow:
     seq: int
     role: str
     content: str
-    extra: str | None
+    source: str
+    proactive: bool
+    reply_to_id: str | None
     ts: str
 
 
@@ -43,22 +45,10 @@ class EmbedBatch(Protocol):
     async def __call__(self, texts: list[str]) -> list[list[float]]: ...
 
 
-def message_rows_from_snapshot(
-    messages: Sequence[Mapping[str, object]],
-) -> list[MessageRow]:
-    """将 Core 脱离持久化 owner 的消息快照转换成评分行。"""
+def message_rows_from_messages(messages: Sequence[Message]) -> list[MessageRow]:
+    """将不可变 Message 前缀转换成反馈评分所需的窄行。"""
 
-    return [
-        MessageRow(
-            id=str(message["id"]),
-            seq=_required_int(message["seq"], field="seq"),
-            role=str(message["role"]),
-            content=str(message.get("content") or ""),
-            extra=_optional_string(message.get("extra")),
-            ts=str(message.get("ts") or ""),
-        )
-        for message in messages
-    ]
+    return [_message_row(message) for message in messages]
 
 
 def clean_text(text: str, max_chars: int = 1200) -> str:
@@ -89,14 +79,51 @@ def parse_quote_parts(content: str) -> QuoteParts:
     )
 
 
-def is_proactive(extra: str | None) -> bool:
-    if not extra:
+def _message_row(message: Message) -> MessageRow:
+    body = message.body
+    role = "user" if isinstance(body, Input) else "assistant" if isinstance(body, Output) else "other"
+    parts = body.parts if isinstance(body, (Input, Output)) else ()
+    content = "\n\n".join(
+        part.value for part in parts
+        if isinstance(part, ContentPart) and part.kind == "text" and isinstance(part.value, str)
+    )
+    reply_ids = [
+        part.value for part in parts
+        if isinstance(part, ContentPart) and part.kind == "reply_ref" and isinstance(part.value, str)
+    ]
+    if len(reply_ids) > 1:
+        raise ValueError("一个 Input 只能引用一条被回复消息")
+    return MessageRow(
+        id=message.message_id,
+        seq=message.seq,
+        role=role,
+        content=content,
+        source=message.source,
+        proactive=_is_proactive_message(message, parts),
+        reply_to_id=reply_ids[0] if reply_ids else None,
+        ts=message.recorded_at.isoformat(),
+    )
+
+
+def _is_proactive_message(message: Message, parts: Sequence[object]) -> bool:
+    """识别新来源输出，并保留迁移消息中明确记录的旧 proactive 事实。"""
+
+    if not isinstance(message.body, Output) or message.body.finish != "complete":
         return False
-    try:
-        payload = json.loads(extra)
-    except json.JSONDecodeError:
-        return "proactive" in extra and "true" in extra.lower()
-    return bool(payload.get("proactive"))
+    for part in parts:
+        if not isinstance(part, ContentPart) or part.kind != "history.provenance":
+            continue
+        value = part.value
+        if not isinstance(value, Mapping) or value.get("schema") != "sessions.messages.v0":
+            continue
+        raw = value.get("extra")
+        if isinstance(raw, str):
+            import json
+
+            decoded = json.loads(raw)
+            if isinstance(decoded, dict) and decoded.get("proactive") is True:
+                return True
+    return message.source not in {"conversation", "legacy-unattributed"}
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -114,148 +141,6 @@ def classify_pua(score: float) -> tuple[str, str, str]:
     if score >= 0.54:
         return "topic_follow", "medium", "pua_medium"
     return "no_topic_follow", "low", "pua_low"
-
-
-def latest_turn_messages(
-    conn: sqlite3.Connection,
-    *,
-    session_key: str,
-    user_content: str,
-    assistant_content: str,
-) -> tuple[MessageRow, MessageRow] | None:
-    user = conn.execute(
-        """
-        SELECT id, seq, role, content, extra, ts
-        FROM messages
-        WHERE session_key = ? AND role = 'user' AND content = ?
-        ORDER BY seq DESC
-        LIMIT 1
-        """,
-        (session_key, user_content),
-    ).fetchone()
-    assistant = conn.execute(
-        """
-        SELECT id, seq, role, content, extra, ts
-        FROM messages
-        WHERE session_key = ? AND role = 'assistant' AND content = ?
-        ORDER BY seq DESC
-        LIMIT 1
-        """,
-        (session_key, assistant_content),
-    ).fetchone()
-    if user is None or assistant is None:
-        return None
-    return _row(user), _row(assistant)
-
-
-def latest_turn_messages_from_rows(
-    rows: Sequence[MessageRow],
-    *,
-    user_message_id: str | None,
-    assistant_message_id: str | None,
-    user_content: str,
-    assistant_content: str,
-) -> tuple[MessageRow, MessageRow] | None:
-    """按 TurnCommitted 身份从脱离快照解析本次 user/assistant。"""
-
-    user = _latest_snapshot_row(
-        rows,
-        role="user",
-        message_id=user_message_id,
-        content=user_content,
-    )
-    assistant = _latest_snapshot_row(
-        rows,
-        role="assistant",
-        message_id=assistant_message_id,
-        content=assistant_content,
-    )
-    if user is None or assistant is None:
-        return None
-    return user, assistant
-
-
-def iter_user_assistant_turns(
-    conn: sqlite3.Connection,
-) -> list[tuple[str, MessageRow, MessageRow]]:
-    rows = conn.execute(
-        """
-        SELECT u.session_key,
-               u.id AS user_id,
-               u.seq AS user_seq,
-               u.role AS user_role,
-               u.content AS user_content,
-               u.extra AS user_extra,
-               u.ts AS user_ts,
-               a.id AS assistant_id,
-               a.seq AS assistant_seq,
-               a.role AS assistant_role,
-               a.content AS assistant_content,
-               a.extra AS assistant_extra,
-               a.ts AS assistant_ts
-        FROM messages u
-        JOIN messages a
-          ON a.id = (
-              SELECT m.id
-              FROM messages m
-              WHERE m.session_key = u.session_key
-                AND m.seq > u.seq
-                AND m.role = 'assistant'
-                AND m.content IS NOT NULL
-              ORDER BY m.seq ASC
-              LIMIT 1
-          )
-        WHERE u.role = 'user'
-          AND u.content IS NOT NULL
-        ORDER BY u.session_key ASC, u.seq ASC
-        """
-    ).fetchall()
-    turns: list[tuple[str, MessageRow, MessageRow]] = []
-    for row in rows:
-        turns.append((
-            str(row["session_key"]),
-            MessageRow(
-                id=str(row["user_id"]),
-                seq=int(row["user_seq"]),
-                role=str(row["user_role"]),
-                content=str(row["user_content"] or ""),
-                extra=row["user_extra"],
-                ts=str(row["user_ts"]),
-            ),
-            MessageRow(
-                id=str(row["assistant_id"]),
-                seq=int(row["assistant_seq"]),
-                role=str(row["assistant_role"]),
-                content=str(row["assistant_content"] or ""),
-                extra=row["assistant_extra"],
-                ts=str(row["assistant_ts"]),
-            ),
-        ))
-    return turns
-
-
-def recent_proactive_messages(
-    conn: sqlite3.Connection,
-    *,
-    session_key: str,
-    before_seq: int,
-    limit: int,
-) -> list[MessageRow]:
-    rows = conn.execute(
-        """
-        SELECT id, seq, role, content, extra, ts
-        FROM messages
-        WHERE session_key = ?
-          AND role = 'assistant'
-          AND seq < ?
-          AND content IS NOT NULL
-        ORDER BY seq DESC
-        LIMIT ?
-        """,
-        (session_key, before_seq, limit * 4),
-    ).fetchall()
-    proactive = [_row(row) for row in rows if is_proactive(row["extra"])]
-    return proactive[:limit]
 
 
 def recent_proactive_messages_from_rows(
@@ -277,46 +162,7 @@ def recent_proactive_messages_from_rows(
         key=lambda row: row.seq,
         reverse=True,
     )[: limit * 4]
-    return [row for row in recent if is_proactive(row.extra)][:limit]
-
-
-def proactive_since_previous_user(
-    conn: sqlite3.Connection,
-    *,
-    session_key: str,
-    before_seq: int,
-    limit: int | None = None,
-) -> list[MessageRow]:
-    previous = conn.execute(
-        """
-        SELECT seq
-        FROM messages
-        WHERE session_key = ?
-          AND role = 'user'
-          AND seq < ?
-        ORDER BY seq DESC
-        LIMIT 1
-        """,
-        (session_key, before_seq),
-    ).fetchone()
-    after_seq = int(previous["seq"]) if previous is not None else -1
-    rows = conn.execute(
-        """
-        SELECT id, seq, role, content, extra, ts
-        FROM messages
-        WHERE session_key = ?
-          AND role = 'assistant'
-          AND seq > ?
-          AND seq < ?
-          AND content IS NOT NULL
-        ORDER BY seq DESC
-        """,
-        (session_key, after_seq, before_seq),
-    ).fetchall()
-    proactive = [_row(row) for row in rows if is_proactive(row["extra"])]
-    if limit is None:
-        return proactive
-    return proactive[:limit]
+    return [row for row in recent if row.proactive][:limit]
 
 
 def proactive_since_previous_user_from_rows(
@@ -338,7 +184,7 @@ def proactive_since_previous_user_from_rows(
             if row.role == "assistant"
             and after_seq < row.seq < before_seq
             and row.content
-            and is_proactive(row.extra)
+            and row.proactive
         ),
         key=lambda row: row.seq,
         reverse=True,
@@ -358,7 +204,12 @@ async def score_followup(
         return None
 
     quote = parse_quote_parts(user.content)
-    quoted_match = _match_quoted(candidates, quote.quoted_text)
+    quoted_match = next(
+        (candidate for candidate in candidates if candidate.id == user.reply_to_id),
+        None,
+    )
+    if quoted_match is None:
+        quoted_match = _match_quoted(candidates, quote.quoted_text)
     if quoted_match is not None:
         return FeedbackScore(
             proactive=quoted_match,
@@ -394,7 +245,6 @@ async def score_followup(
         lag_seconds=_lag_seconds(target.ts, user.ts),
     )
 
-
 def _match_quoted(candidates: list[MessageRow], quoted_text: str | None) -> MessageRow | None:
     if not quoted_text:
         return None
@@ -413,45 +263,3 @@ def _lag_seconds(start: str, end: str) -> int | None:
         return int(datetime.fromisoformat(end).timestamp() - datetime.fromisoformat(start).timestamp())
     except ValueError:
         return None
-
-
-def _row(row: sqlite3.Row) -> MessageRow:
-    return MessageRow(
-        id=str(row["id"]),
-        seq=int(row["seq"]),
-        role=str(row["role"]),
-        content=str(row["content"] or ""),
-        extra=row["extra"],
-        ts=str(row["ts"]),
-    )
-
-
-def _latest_snapshot_row(
-    rows: Sequence[MessageRow],
-    *,
-    role: str,
-    message_id: str | None,
-    content: str,
-) -> MessageRow | None:
-    candidates = [row for row in rows if row.role == role]
-    if message_id is not None:
-        candidates = [row for row in candidates if row.id == message_id]
-    else:
-        candidates = [row for row in candidates if row.content == content]
-    if message_id is not None and candidates and content:
-        candidates = [row for row in candidates if row.content == content]
-    return max(candidates, key=lambda row: row.seq, default=None)
-
-
-def _optional_string(value: object) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise TypeError("消息 extra 必须是字符串或 None")
-    return value
-
-
-def _required_int(value: object, *, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise TypeError(f"消息 {field} 必须是整数")
-    return int(value)

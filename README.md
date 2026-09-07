@@ -2,20 +2,16 @@
 
 Akashic proactive feedback plugin.
 
-## v3 接入
+## Message runtime 接入
 
 插件入口是 module-level `api_version = 3` 与 `apply(ctx, config)`：
 
-- 通过 Core `AFTER_TURN_COMMITTED` 串行接入点观察已提交 Turn；
-- 通过 `SESSION_READ` 读取脱离持久化 owner 的 Session 快照；
+- 通过 `core.message_catalog` 追赶已提交 Message head，并用 `turn.projection.v1`
+  从完整前缀识别已完成回复；
 - 反馈数据库由 Core 分配的 `ctx.data_root` 独占，Dashboard 与 Mobile 只读同一投影；
-- `apply` 不读取或写入正式 `sessions.db`，候选期不会访问正式 Session；候选没有
-  反馈 DB 时也不会为了重放而创建文件；已提交 Turn 的 inbox 只保存
-  session/turn/message identity，不保存 user/assistant 正文。Core 正式 generation
-  启动时会在最多 64 个既有 session、最多 256 个 Turn 的边界内用 `SESSION_READ`
-  重新发现已提交但尚未进入 inbox 的 eligible Turn；只把 ordered user IDs 和
-  assistant ID 写入 inbox，正文只在评分内存中重建。候选 generation 不执行 discovery，
-  因而不会写正式 DB 或事件。
+- `apply` 不读取或写入正式 Message 数据；候选期不会启动 watcher。正式 generation
+  启动后从 Core 目录重扫列出的 Session，只把 ordered input IDs、ending output ID
+  和 Session identity 写入 inbox，正文只在评分内存中从 Message 重建。
 
 ### Durable history pull
 
@@ -62,9 +58,8 @@ python scripts/migrate_feedback_previews.py \
   --feedback-db <workspace>/plugin-data/<proactive-feedback-data-root>/proactive_feedback.db
 ```
 
-插件不再声明 v2 `Plugin` class、EventBus listener、`ProactiveFeedbackRecorded` 或 tool
-ABI；v3 运行路径只观察 Core 的 committed Turn，并通过上述只读 history service 暴露
-已持久化反馈。
+插件不声明 EventBus listener、`TurnCommitted` 或旧 Session snapshot ABI；运行路径只消费
+Message 与无状态 Turn 投影，并通过上述只读 history service 暴露已持久化反馈。
 
 ## 移动端看板
 
