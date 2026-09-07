@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +56,9 @@ def open_db(path: Path) -> sqlite3.Connection:
 
     # 1. Open with WAL and full synchronous durability.
     path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
+    if existed:
+        _prepare_schema_backup(path)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     _ = conn.execute("PRAGMA journal_mode = WAL")
@@ -133,7 +138,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     _ensure_column(conn, "user_content_preview")
     _ensure_column(conn, "assistant_content_preview")
     _ensure_column(conn, "proactive_content_preview")
-    _ensure_input_column(conn, "user_message_ids_json")
+    _migrate_schema(conn)
     conn.commit()
     return conn
 
@@ -523,39 +528,106 @@ def _optional_input_text(value: str, field: str) -> None:
 def _validate_user_message_ids(user_message_ids: tuple[str, ...]) -> None:
     if not user_message_ids:
         raise ValueError("input inbox user_message_ids 不能为空")
-    if len(set(user_message_ids)) != len(user_message_ids):
-        raise ValueError("input inbox user_message_ids 不能重复")
     for message_id in user_message_ids:
         _required_input_text(message_id, "user_message_id")
+    if len(set(user_message_ids)) != len(user_message_ids):
+        raise ValueError("input inbox user_message_ids 不能重复")
 
 
-def _decode_user_message_ids(value: object, fallback: str) -> tuple[str, ...]:
-    if isinstance(value, str) and value:
+def _decode_user_message_ids(value: object, expected_last: str) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        raise TypeError("input inbox user_message_ids_json 必须是 JSON 字符串")
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError("input inbox user_message_ids_json 不是有效 JSON") from error
+    if not isinstance(decoded, list):
+        raise ValueError("input inbox user_message_ids_json 必须是数组")
+    ids = tuple(decoded)
+    _validate_user_message_ids(ids)
+    if ids[-1] != expected_last:
+        raise ValueError("input inbox ordered IDs 的最后一项必须是 user_message_id")
+    return ids
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """把 schema 0 一次性迁到 1；正常读取不再修复坏行。"""
+
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version == 1:
+        return
+    if version != 0:
+        raise RuntimeError(f"unsupported proactive feedback schema version: {version}")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(proactive_feedback_input_inbox)"
+            )
+        }
+        if "user_message_ids_json" not in columns:
+            conn.execute(
+                "ALTER TABLE proactive_feedback_input_inbox "
+                "ADD COLUMN user_message_ids_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        rows = conn.execute(
+            """
+            SELECT id, user_message_id FROM proactive_feedback_input_inbox
+            WHERE user_message_ids_json = '[]' ORDER BY id
+            """
+        ).fetchall()
+        for row in rows:
+            message_id = str(row["user_message_id"])
+            _required_input_text(message_id, "user_message_id")
+            conn.execute(
+                "UPDATE proactive_feedback_input_inbox "
+                "SET user_message_ids_json = ? WHERE id = ?",
+                (json.dumps([message_id], ensure_ascii=False), int(row["id"])),
+            )
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    except (sqlite3.Error, TypeError, ValueError):
+        conn.rollback()
+        raise
+
+
+def _prepare_schema_backup(path: Path) -> None:
+    """在旧数据库首次写入前创建完整恢复点。"""
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"feedback database must be a regular file: {path}")
+    with closing(
+        sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+    ) as source:
+        version = int(source.execute("PRAGMA user_version").fetchone()[0])
+        if version == 1:
+            return
+        if version != 0:
+            raise RuntimeError(f"unsupported proactive feedback schema version: {version}")
+        backup = path.with_name(path.name + ".before-message-ids")
+        if backup.exists() or backup.is_symlink():
+            raise FileExistsError(f"feedback migration backup already exists: {backup}")
+        created = False
         try:
-            decoded = json.loads(value)
-        except json.JSONDecodeError:
-            decoded = None
-        if decoded and isinstance(decoded, list) and all(
-            isinstance(item, str) and item for item in decoded
-        ):
-            ids = tuple(decoded)
-            if len(set(ids)) == len(ids) and ids[-1] == fallback:
-                return ids
-    return (fallback,)
-
-
-def _ensure_input_column(conn: sqlite3.Connection, name: str) -> None:
-    columns = {
-        str(row[1])
-        for row in conn.execute(
-            "PRAGMA table_info(proactive_feedback_input_inbox)"
-        )
-    }
-    if name not in columns:
-        _ = conn.execute(
-            "ALTER TABLE proactive_feedback_input_inbox "
-            "ADD COLUMN user_message_ids_json TEXT NOT NULL DEFAULT '[]'"
-        )
+            descriptor = os.open(
+                backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            os.close(descriptor)
+            created = True
+            with closing(sqlite3.connect(backup)) as destination:
+                source.backup(destination)
+                if destination.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                    raise sqlite3.DatabaseError("feedback migration backup is corrupt")
+        except BaseException:
+            if created:
+                backup.unlink()
+            raise
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def pending_feedback_outbox(
