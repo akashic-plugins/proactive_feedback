@@ -84,7 +84,7 @@ def _runtime(log: MessageLog, db_path: Path):
 def test_module_uses_message_runtime_contract() -> None:
     loaded = ComposablePlugin.from_module(feedback)
     assert loaded.name == "proactive_feedback"
-    assert loaded.version == "4.0.0"
+    assert loaded.version == "4.0.1"
     assert inspect.signature(feedback.apply).parameters.keys() == {"ctx", "config"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
@@ -354,5 +354,71 @@ def test_mobile_projection_rejects_unknown_method_without_writing(tmp_path: Path
         with pytest.raises(feedback.MobileUiRpcInvalidRequest):
             runtime.query_mobile("feedback.delete", {}, session_id=None, turn_id=None)
         assert not runtime._db_path.exists()
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_history_read_keeps_event_loop_available(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    log = MessageLog(tmp_path / "sessions.db")
+    entered, release = threading.Event(), threading.Event()
+    task = None
+    try:
+        _append_turn(log)
+        runtime = _runtime(log, tmp_path / "feedback.db")
+        reader_type = type(runtime._catalog.reader("akashic:test"))
+        original = reader_type.snapshot
+
+        def slow_snapshot(reader, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("event loop did not release the history reader")
+            return original(reader, **kwargs)
+
+        monkeypatch.setattr(reader_type, "snapshot", slow_snapshot)
+        task = asyncio.create_task(runtime._discover_changed(dict(runtime._catalog.snapshot_heads())))
+        assert await asyncio.to_thread(entered.wait, 5)
+        # 历史读取仍未释放时，调用者已能恢复执行并处理心跳或取消。
+        assert not task.done()
+        release.set()
+        await task
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_acks_accepted_feedback_without_rescoring(tmp_path: Path, monkeypatch) -> None:
+    log = MessageLog(tmp_path / "sessions.db")
+    try:
+        _append_turn(log)
+        db_path = tmp_path / "feedback.db"
+        first = _runtime(log, db_path)
+        await first._discover_changed(dict(first._catalog.snapshot_heads()))
+
+        def crash_before_ack(_row_id):
+            raise RuntimeError("crash before inbox ack")
+
+        monkeypatch.setattr(first, "_complete", crash_before_ack)
+        with pytest.raises(RuntimeError, match="crash before inbox ack"):
+            await first._process_pending_inputs()
+        with sqlite3.connect(db_path) as db:
+            accepted = db.execute("SELECT * FROM proactive_feedback_events").fetchall()
+            assert len(accepted) == 1
+            assert db.execute("SELECT processed_at FROM proactive_feedback_input_inbox").fetchone() == (None,)
+
+        async def reject_rescore(**_kwargs):
+            raise AssertionError("accepted feedback must not be scored again")
+
+        monkeypatch.setattr(feedback, "score_followup", reject_rescore)
+        restarted = _runtime(log, db_path)
+        assert await restarted._process_pending_inputs() is False
+        with sqlite3.connect(db_path) as db:
+            assert db.execute("SELECT * FROM proactive_feedback_events").fetchall() == accepted
+            assert db.execute("SELECT processed_at FROM proactive_feedback_input_inbox").fetchone()[0] is not None
     finally:
         log.close()

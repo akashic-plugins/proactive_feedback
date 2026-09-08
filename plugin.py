@@ -19,7 +19,7 @@ from session.message import Input, Message, Output
 from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
     FeedbackEvent, FeedbackInputRecord, insert_feedback, insert_feedback_input,
-    mark_feedback_input_processed, open_db, pending_feedback_inputs,
+    feedback_identity_exists, mark_feedback_input_processed, open_db, pending_feedback_inputs,
 )
 from .history import PROACTIVE_FEEDBACK_HISTORY, SqliteFeedbackHistory
 from .scorer import (
@@ -34,7 +34,7 @@ _RETRY_SECONDS = 1.0
 
 api_version = 3
 name = "proactive_feedback"
-version = "4.0.0"
+version = "4.0.1"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
 inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI_SLOTS, EMBEDDINGS)
@@ -139,7 +139,9 @@ class ProactiveFeedbackRuntime:
                 session_attributes = attributes.get(session_id)
                 if session_attributes is None or session_attributes.visibility != "listed":
                     continue
-                messages = self._catalog.reader(session_id).snapshot(through_seq=head)
+                messages = await asyncio.to_thread(
+                    self._catalog.reader(session_id).snapshot, through_seq=head,
+                )
                 await self._discover_session(sink, session_id, messages)
         finally:
             sink.close()
@@ -148,7 +150,7 @@ class ProactiveFeedbackRuntime:
                                 messages: tuple[Message, ...]) -> None:
         """把含用户输入与最终输出的完整 Turn 身份写入插件 inbox。"""
         # 1. 每个前缀只建一次候选索引，避免每个 Turn 重新扫描历史。
-        rows = message_rows_from_messages(messages)
+        rows = await asyncio.to_thread(message_rows_from_messages, messages)
         candidates = CandidateIndex(rows)
         by_id = {message.message_id: message for message in messages}
         row_by_id = {row.id: row for row in rows}
@@ -156,7 +158,8 @@ class ProactiveFeedbackRuntime:
             message.source for message in messages if isinstance(message.body, Input)
         ))
         for source in sources:
-            for turn in self._projection.project(messages, source):
+            turns = await asyncio.to_thread(self._projection.project, messages, source)
+            for turn in turns:
                 # 2. 历史追赶必须让聊天、心跳和取消任务继续运行。
                 await asyncio.sleep(0)
                 if turn.status != "complete" or turn.ending_message_id is None:
@@ -201,8 +204,21 @@ class ProactiveFeedbackRuntime:
         return bool(results) and not all(results)
 
     async def _process_record(self, record: FeedbackInputRecord) -> bool:
-        messages = self._catalog.reader(record.session_key).snapshot()
-        rows = message_rows_from_messages(messages)
+        """恢复已接受反馈的 inbox 回执；只有新身份才读取历史并评分。"""
+        # 1. accepted payload 已经是权威结果，重启不能重新评分或覆盖它。
+        sink = open_db(self._db_path)
+        try:
+            if feedback_identity_exists(
+                sink, session_key=record.session_key, user_message_id=record.user_message_id,
+            ):
+                mark_feedback_input_processed(sink, row_id=record.row_id)
+                return True
+        finally:
+            sink.close()
+
+        # 2. 完整历史解码在工作线程完成，不能拖住聊天和 Host Bridge 心跳。
+        messages = await asyncio.to_thread(self._catalog.reader(record.session_key).snapshot)
+        rows = await asyncio.to_thread(message_rows_from_messages, messages)
         by_id = {row.id: row for row in rows}
         try:
             user_rows = [by_id[message_id] for message_id in record.user_message_ids]
