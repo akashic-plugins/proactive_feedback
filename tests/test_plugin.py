@@ -311,7 +311,9 @@ async def apply(ctx, config):
 ''', encoding="utf-8")
     shutil.copytree(
         Path(__file__).parents[1], sources / "proactive_feedback",
-        ignore=shutil.ignore_patterns(".git", ".pytest_cache", "__pycache__", "tests"),
+        ignore=shutil.ignore_patterns(
+            ".git", ".pytest_cache", "__pycache__", "tests", ".akashic-core", ".plugin-contracts",
+        ),
     )
     try:
         await host.load_all()
