@@ -71,7 +71,7 @@ def _append_turn(log: MessageLog, session_id: str = "akashic:test") -> None:
     )
 
 
-def _runtime(log: MessageLog, db_path: Path) -> feedback.ProactiveFeedbackRuntime:
+def _runtime(log: MessageLog, db_path: Path):
     async def embed(texts: list[str]) -> list[list[float]]:
         return [[1.0, 0.0] for _ in texts]
 
@@ -86,7 +86,7 @@ def test_module_uses_message_runtime_contract() -> None:
     assert loaded.name == "proactive_feedback"
     assert loaded.version == "4.0.0"
     assert inspect.signature(feedback.apply).parameters.keys() == {"ctx", "config"}
-    source = Path(feedback.__file__).read_text(encoding="utf-8")
+    source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
         "AFTER_TURN_COMMITTED", "TurnCommitted", "SESSION_READ",
         "SessionReadService", "event_bus", "sessions.db",
@@ -126,9 +126,9 @@ async def test_complete_message_turn_writes_one_immutable_feedback(tmp_path: Pat
         _append_turn(log)
         runtime = _runtime(log, tmp_path / "plugin-data" / "proactive_feedback.db")
         heads = dict(runtime._catalog.snapshot_heads())
-        runtime._discover_changed(heads)
+        await runtime._discover_changed(heads)
         assert await runtime._process_pending_inputs() is False
-        runtime._discover_changed(heads)
+        await runtime._discover_changed(heads)
         assert await runtime._process_pending_inputs() is False
 
         page = feedback.SqliteFeedbackHistory(runtime._db_path).page(
@@ -151,7 +151,7 @@ async def test_restart_replays_durable_identity_without_message_copies(tmp_path:
         _append_turn(log)
         db_path = tmp_path / "plugin-data" / "proactive_feedback.db"
         first = _runtime(log, db_path)
-        first._discover_changed(dict(first._catalog.snapshot_heads()))
+        await first._discover_changed(dict(first._catalog.snapshot_heads()))
 
         restarted = _runtime(log, db_path)
         assert await restarted._process_pending_inputs() is False
@@ -179,11 +179,107 @@ async def test_open_turn_is_not_recorded_until_final_output(tmp_path: Path) -> N
                        content={"text": check_text})
         u.append("u", Input((ContentPart("text", "继续"),)))
         runtime = _runtime(log, tmp_path / "feedback.db")
-        runtime._discover_changed(dict(runtime._catalog.snapshot_heads()))
+        await runtime._discover_changed(dict(runtime._catalog.snapshot_heads()))
         with sqlite3.connect(runtime._db_path) as connection:
             assert connection.execute(
                 "SELECT count(*) FROM proactive_feedback_input_inbox"
             ).fetchone() == (0,)
+    finally:
+        log.close()
+
+
+def test_candidate_index_keeps_user_boundaries_and_recent_window() -> None:
+    rows = [
+        feedback.MessageRow(str(seq), seq, role, content, "conversation", proactive, None, "")
+        for seq, role, content, proactive in (
+            (0, "assistant", "old", True), (1, "user", "first", False),
+            (2, "assistant", "one", True), (3, "assistant", "two", True),
+            (4, "user", "next", False), (5, "assistant", "plain", False),
+            (6, "assistant", "", True), (7, "assistant", "plain", False),
+            (8, "assistant", "plain", False), (9, "assistant", "plain", False),
+            (10, "assistant", "future", True),
+        )
+    ]
+    index = feedback.CandidateIndex(list(reversed(rows)))
+    assert [row.id for row in index.since_previous_user(before_seq=4, limit=8)] == ["3", "2"]
+    assert index.since_previous_user(before_seq=10, limit=8) == []
+    assert index.recent(before_seq=10, limit=1) == []
+    assert [row.id for row in index.recent(before_seq=11, limit=1)] == ["10"]
+    assert index.recent(before_seq=0, limit=1) == []
+
+
+@pytest.mark.asyncio
+async def test_scoring_failure_does_not_repeat_discovery_or_block_new_heads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = MessageLog(tmp_path / "sessions.db")
+    _append_turn(log)
+    runtime = _runtime(log, tmp_path / "feedback.db")
+    discovered: list[str] = []
+    complete = asyncio.Event()
+    discover = runtime._discover_session
+    attempts = 0
+
+    async def record_discovery(sink, session_id, messages):
+        await discover(sink, session_id, messages)
+        discovered.append(session_id)
+        if session_id == "akashic:second":
+            complete.set()
+
+    async def fail_scoring():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            _append_turn(log, "akashic:second")
+        raise RuntimeError("accepted feedback payload conflict")
+
+    monkeypatch.setattr(runtime, "_discover_session", record_discovery)
+    monkeypatch.setattr(runtime, "_process_pending_inputs", fail_scoring)
+    monkeypatch.setattr(feedback, "_RETRY_SECONDS", 0)
+    task = asyncio.create_task(runtime.follow())
+    try:
+        async with asyncio.timeout(3):
+            await complete.wait()
+        assert discovered == ["akashic:test", "akashic:second"]
+        assert attempts >= 2
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_history_discovery_yields_between_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = MessageLog(tmp_path / "sessions.db")
+    try:
+        _append_turn(log)
+        user = log.writer("akashic:test", author="user", source="conversation",
+                          body_types=(Input,), content={"text": check_text, "reply_ref": _check_ref})
+        user.append("user-2", Input((ContentPart("text", "继续"), ContentPart("reply_ref", "proactive-1"))))
+        assistant = log.writer("akashic:test", author="assistant", source="conversation",
+                               body_types=(Output,), content={"text": check_text})
+        assistant.append("assistant-2", Output((ContentPart("text", "回答"),), "complete"))
+        runtime = _runtime(log, tmp_path / "feedback.db")
+        first_written = asyncio.Event()
+        writes = 0
+        insert = feedback.insert_feedback_input
+
+        def record_insert(*args, **kwargs):
+            nonlocal writes
+            result = insert(*args, **kwargs)
+            writes += 1
+            first_written.set()
+            return result
+
+        monkeypatch.setattr(feedback, "insert_feedback_input", record_insert)
+        task = asyncio.create_task(runtime._discover_changed(dict(runtime._catalog.snapshot_heads())))
+        await first_written.wait()
+        assert writes == 1
+        await task
+        assert writes == 2
     finally:
         log.close()
 
