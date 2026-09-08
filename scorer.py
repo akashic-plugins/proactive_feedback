@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 from collections.abc import Mapping, Sequence
@@ -143,53 +144,30 @@ def classify_pua(score: float) -> tuple[str, str, str]:
     return "no_topic_follow", "low", "pua_low"
 
 
-def recent_proactive_messages_from_rows(
-    rows: Sequence[MessageRow],
-    *,
-    before_seq: int,
-    limit: int,
-) -> list[MessageRow]:
-    """从脱离快照取出当前 user 之前最近的主动 assistant。"""
+class CandidateIndex:
+    """为一个只读 Message 前缀索引用户边界与主动输出。"""
 
-    recent = sorted(
-        (
-            row
-            for row in rows
-            if row.role == "assistant"
-            and row.seq < before_seq
-            and row.content
-        ),
-        key=lambda row: row.seq,
-        reverse=True,
-    )[: limit * 4]
-    return [row for row in recent if row.proactive][:limit]
+    def __init__(self, rows: Sequence[MessageRow]) -> None:
+        ordered = sorted(rows, key=lambda row: row.seq)
+        self._users = [row.seq for row in ordered if row.role == "user"]
+        self._assistants = [row for row in ordered if row.role == "assistant" and row.content]
+        self._assistant_seqs = [row.seq for row in self._assistants]
+        self._proactive = [row for row in self._assistants if row.proactive]
+        self._proactive_seqs = [row.seq for row in self._proactive]
 
+    def recent(self, *, before_seq: int, limit: int) -> list[MessageRow]:
+        """保留原有最近 limit × 4 条非空助手消息的候选窗口。"""
+        end = bisect_left(self._assistant_seqs, before_seq)
+        recent = reversed(self._assistants[max(0, end - limit * 4):end])
+        return [row for row in recent if row.proactive][:limit]
 
-def proactive_since_previous_user_from_rows(
-    rows: Sequence[MessageRow],
-    *,
-    before_seq: int,
-    limit: int | None = None,
-) -> list[MessageRow]:
-    """从脱离快照取出上一个 user 之后的主动 assistant。"""
-
-    previous = [
-        row for row in rows if row.role == "user" and row.seq < before_seq
-    ]
-    after_seq = max((row.seq for row in previous), default=-1)
-    candidates = sorted(
-        (
-            row
-            for row in rows
-            if row.role == "assistant"
-            and after_seq < row.seq < before_seq
-            and row.content
-            and row.proactive
-        ),
-        key=lambda row: row.seq,
-        reverse=True,
-    )
-    return candidates if limit is None else candidates[:limit]
+    def since_previous_user(self, *, before_seq: int, limit: int) -> list[MessageRow]:
+        """只选上一个用户输入之后、当前输入之前的主动输出。"""
+        previous = bisect_left(self._users, before_seq)
+        after_seq = self._users[previous - 1] if previous else -1
+        start = bisect_right(self._proactive_seqs, after_seq)
+        end = bisect_left(self._proactive_seqs, before_seq)
+        return list(reversed(self._proactive[max(start, end - limit):end]))
 
 
 async def score_followup(

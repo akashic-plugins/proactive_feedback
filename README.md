@@ -12,6 +12,9 @@ Akashic proactive feedback plugin.
 - `apply` 不读取或写入正式 Message 数据；候选期不会启动 watcher。正式 generation
   启动后从 Core 目录重扫列出的 Session，只把 ordered input IDs、ending output ID
   和 Session identity 写入 inbox，正文只在评分内存中从 Message 重建。
+- 历史发现与 inbox 评分独立推进：评分失败不会重扫已发现的 Message 前缀，
+  也不阻止后续 head 进入 inbox。每个前缀只建一次候选索引，逐 Turn 让出执行时间，
+  避免历史追赶阻塞聊天与运行时心跳。未完成评分每秒重试，原错误仍可见。
 
 ### Durable history pull
 

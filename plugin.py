@@ -23,9 +23,8 @@ from .db import (
 )
 from .history import PROACTIVE_FEEDBACK_HISTORY, SqliteFeedbackHistory
 from .scorer import (
-    EmbedBatch, MessageRow, message_rows_from_messages, parse_quote_parts,
-    proactive_since_previous_user_from_rows, recent_proactive_messages_from_rows,
-    score_followup,
+    CandidateIndex, EmbedBatch, MessageRow, message_rows_from_messages,
+    parse_quote_parts, score_followup,
 )
 
 logger = logging.getLogger("plugin.proactive_feedback")
@@ -98,22 +97,38 @@ class ProactiveFeedbackRuntime:
         self._heads: dict[str, int] = {}
 
     async def follow(self) -> None:
-        """启动时重扫完整事实，随后按 head 变化继续发现并处理耐久 inbox。"""
+        """独立追赶 Message head 与重试耐久 inbox，避免评分失败重扫历史。"""
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self._follow_heads(), name="feedback-discovery")
+            tasks.create_task(self._follow_inputs(), name="feedback-scoring")
+
+    async def _follow_heads(self) -> None:
+        """发现成功后推进 head；评分结果不改变发现进度。"""
         async for heads in self._catalog.follow():
             while True:
                 try:
-                    self._discover_changed(dict(heads))
-                    _ = await self._process_pending_inputs()
+                    await self._discover_changed(dict(heads))
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("proactive_feedback Message 消费失败")
+                    logger.exception("proactive_feedback Message 发现失败")
                     await asyncio.sleep(_RETRY_SECONDS)
                     continue
                 self._heads = dict(heads)
                 break
 
-    def _discover_changed(self, heads: Mapping[str, int]) -> None:
+    async def _follow_inputs(self) -> None:
+        """独立重试未完成评分；错误保持可见，不拖住新消息发现。"""
+        while True:
+            try:
+                _ = await self._process_pending_inputs()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("proactive_feedback Message 消费失败")
+            await asyncio.sleep(_RETRY_SECONDS)
+
+    async def _discover_changed(self, heads: Mapping[str, int]) -> None:
         """只按 Core 目录选择列出的 Session；每个完整前缀可安全重复投影。"""
         attributes = self._catalog.snapshot_attributes()
         sink = open_db(self._db_path)
@@ -125,14 +140,16 @@ class ProactiveFeedbackRuntime:
                 if session_attributes is None or session_attributes.visibility != "listed":
                     continue
                 messages = self._catalog.reader(session_id).snapshot(through_seq=head)
-                self._discover_session(sink, session_id, messages)
+                await self._discover_session(sink, session_id, messages)
         finally:
             sink.close()
 
-    def _discover_session(self, sink: sqlite3.Connection, session_id: str,
-                          messages: tuple[Message, ...]) -> None:
+    async def _discover_session(self, sink: sqlite3.Connection, session_id: str,
+                                messages: tuple[Message, ...]) -> None:
         """把含用户输入与最终输出的完整 Turn 身份写入插件 inbox。"""
+        # 1. 每个前缀只建一次候选索引，避免每个 Turn 重新扫描历史。
         rows = message_rows_from_messages(messages)
+        candidates = CandidateIndex(rows)
         by_id = {message.message_id: message for message in messages}
         row_by_id = {row.id: row for row in rows}
         sources = tuple(dict.fromkeys(
@@ -140,6 +157,8 @@ class ProactiveFeedbackRuntime:
         ))
         for source in sources:
             for turn in self._projection.project(messages, source):
+                # 2. 历史追赶必须让聊天、心跳和取消任务继续运行。
+                await asyncio.sleep(0)
                 if turn.status != "complete" or turn.ending_message_id is None:
                     continue
                 members = [by_id[message_id] for message_id in turn.message_ids]
@@ -150,7 +169,7 @@ class ProactiveFeedbackRuntime:
                 aggregate = _aggregate_user_rows(
                     [row_by_id[message.message_id] for message in users]
                 )
-                if not self._candidates(rows, aggregate, users[0].seq):
+                if not self._candidates(candidates, aggregate, users[0].seq):
                     continue
                 insert_feedback_input(
                     sink, session_key=session_id,
@@ -162,12 +181,12 @@ class ProactiveFeedbackRuntime:
                 )
 
     @staticmethod
-    def _candidates(rows: list[MessageRow], user: MessageRow,
+    def _candidates(index: CandidateIndex, user: MessageRow,
                     before_seq: int) -> list[MessageRow]:
         quote = parse_quote_parts(user.content)
         if user.reply_to_id is not None or quote.quoted_text:
-            return recent_proactive_messages_from_rows(rows, before_seq=before_seq, limit=64)
-        return proactive_since_previous_user_from_rows(rows, before_seq=before_seq, limit=8)
+            return index.recent(before_seq=before_seq, limit=64)
+        return index.since_previous_user(before_seq=before_seq, limit=8)
 
     async def _process_pending_inputs(self) -> bool:
         """按 inbox 顺序处理；缺失的权威 Message 保留到后续日志变化。"""
@@ -199,7 +218,7 @@ class ProactiveFeedbackRuntime:
         if any(row.role != "user" for row in user_rows) or assistant.role != "assistant":
             raise ValueError("proactive_feedback inbox Message 类型与原身份不一致")
         user = _aggregate_user_rows(user_rows)
-        candidates = self._candidates(rows, user, user_rows[0].seq)
+        candidates = self._candidates(CandidateIndex(rows), user, user_rows[0].seq)
         if not candidates:
             self._complete(record.row_id)
             return True
