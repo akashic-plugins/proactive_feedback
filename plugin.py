@@ -3,17 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 from agent.plugin_composition import (
     Context, EMBEDDINGS, Embeddings, MobileUiDefinition, MobileUiNavigation,
-    MobileUiRpcInvalidRequest, RUNTIME_STARTED, RUNTIME_STOPPING, UI_SLOTS,
+    MobileUiRpcInvalidRequest, RUNTIME_STARTED, RUNTIME_STOPPING, ServiceKey,
+    UI_SLOTS,
 )
 from agent.plugin_composition.messages import MESSAGE_CATALOG, MessageCatalog
-from plugins.turn_projection.plugin import TURN_PROJECTION, TurnProjection
-from session.message import Input, Message, Output
+from agent.plugin_contracts import Input, Message, Output
 
 from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
@@ -30,6 +30,25 @@ logger = logging.getLogger("plugin.proactive_feedback")
 _FEEDBACK_DB_NAME = "proactive_feedback.db"
 _PREVIEW_MAX_CHARS = 2400
 _RETRY_SECONDS = 1.0
+
+
+class ProjectedTurn(Protocol):
+    """Consumer-owned view of the Turn facts needed by feedback scoring."""
+
+    status: str
+    ending_message_id: str | None
+    message_ids: tuple[str, ...]
+
+
+class TurnProjection(Protocol):
+    """Read-only projection boundary supplied by the installed turn owner."""
+
+    def project(
+        self, messages: Sequence[Message], source: str
+    ) -> tuple[ProjectedTurn, ...]: ...
+
+
+TURN_PROJECTION = ServiceKey[TurnProjection]("turn.projection.v1")
 
 api_version = 3
 name = "proactive_feedback"
