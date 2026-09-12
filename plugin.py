@@ -11,9 +11,8 @@ from agent.plugin_composition import (
     Context, EMBEDDINGS, Embeddings, MobileUiDefinition, MobileUiNavigation,
     MobileUiRpcInvalidRequest, RUNTIME_STARTED, RUNTIME_STOPPING, UI_SLOTS,
 )
-from agent.plugin_composition.messages import MESSAGE_CATALOG
+from agent.plugin_composition.messages import MESSAGE_CATALOG, MessageCatalog
 from plugins.turn_projection.plugin import TURN_PROJECTION, TurnProjection
-from session.log import MessageCatalog
 from session.message import Input, Message, Output
 
 from .dashboard import ProactiveFeedbackDashboardReader
