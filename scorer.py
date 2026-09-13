@@ -8,7 +8,7 @@ from datetime import datetime
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
-from session.message import ContentPart, Input, Message, Output
+from agent.plugin_contracts import ContentPart, Input, Message, Output
 
 
 @dataclass(frozen=True)

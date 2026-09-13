@@ -12,10 +12,9 @@ from agent.plugin_composition import (
     MobileUiRpcInvalidRequest, RUNTIME_STARTED, RUNTIME_STOPPING, UI_SLOTS,
 )
 from agent.plugin_composition.messages import MESSAGE_CATALOG
-from plugins.turn_projection.plugin import TURN_PROJECTION, TurnProjection
-from session.log import MessageCatalog
-from session.message import Input, Message, Output
+from agent.plugin_contracts import Input, Message, Output
 
+from .contracts import MessageCatalog, TURN_PROJECTION, TurnProjection
 from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
     FeedbackEvent, FeedbackInputRecord, insert_feedback, insert_feedback_input,
