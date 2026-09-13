@@ -13,11 +13,20 @@ import shutil
 import sqlite3
 import uuid
 
-from agent.plugins.manifest import (
-    ensure_workspace_plugin_data_dir,
-    validate_workspace_plugin_data_path,
-)
-from bootstrap.workspace_lock import WorkspaceInstanceLock
+if __package__:
+    from ._migration_support import (
+        WorkspaceInstanceLock,
+        ensure_workspace_plugin_data_dir,
+        validate_marketplace,
+        validate_workspace_plugin_data_path,
+    )
+else:  # direct CLI execution from the installed plugin artifact
+    from _migration_support import (
+        WorkspaceInstanceLock,
+        ensure_workspace_plugin_data_dir,
+        validate_marketplace,
+        validate_workspace_plugin_data_path,
+    )
 
 
 _DATABASE = "proactive_feedback.db"
@@ -117,8 +126,7 @@ def _migrate_locked(workspace: Path, marketplace: str) -> dict[str, object]:
     """Stage, publish, and verify one idempotent v2 database migration."""
 
     # 1. Validate all durable paths before opening SQLite.
-    if not marketplace or not marketplace.replace("-", "").replace("_", "").isalnum():
-        raise ValueError(f"Proactive Feedback marketplace 无效: {marketplace}")
+    validate_marketplace(marketplace)
     legacy_root = workspace / "proactive_feedback"
     source = legacy_root / _DATABASE
     if (
