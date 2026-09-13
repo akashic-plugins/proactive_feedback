@@ -289,26 +289,6 @@ async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
     tmp_path: Path,
 ) -> None:
     host, store, log, _artifacts, sources = environment(tmp_path, reply=True)
-    embeddings = sources / "embeddings_probe"
-    embeddings.mkdir()
-    (embeddings / "plugin.py").write_text('''
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
-from agent.plugin_composition import EMBEDDINGS
-api_version = 3
-name = "embeddings_probe"
-version = "1.0.0"
-inject = ()
-class Bound:
-    async def embed(self, texts):
-        return SimpleNamespace(vectors=tuple((1.0, 0.0) for _ in texts))
-class Embeddings:
-    @asynccontextmanager
-    async def bind(self):
-        yield Bound()
-async def apply(ctx, config):
-    await ctx.provide(EMBEDDINGS, Embeddings())
-''', encoding="utf-8")
     shutil.copytree(
         Path(__file__).parents[1], sources / "proactive_feedback",
         ignore=shutil.ignore_patterns(

@@ -120,3 +120,14 @@ def test_legacy_parent_symlink_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError, match="不存在或不安全"):
         _ = migration.migrate_v2_data(workspace, "github")
+
+
+def test_existing_workspace_lock_fails_before_migration(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    owner = migration.WorkspaceInstanceLock(workspace)
+    owner.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="已由其他 runtime 占用"):
+            _ = migration.migrate_v2_data(workspace, "github")
+    finally:
+        owner.release()
