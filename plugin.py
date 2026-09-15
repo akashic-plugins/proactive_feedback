@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from importlib import import_module
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -36,22 +37,20 @@ name = "proactive_feedback"
 version = "4.0.1"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
-inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI_SLOTS, EMBEDDINGS)
-skill_roots: tuple[str, ...] = ()
-drift_skill_roots: tuple[str, ...] = ()
-workspace_roots: tuple[str, ...] = ()
-dashboard_module = "dashboard.py"
-web_module = "web_module.js"
-web_requires = ("workbench.panels.v2",)
-web_provides = ()
-web_contract_digests = {
-    "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
-}
+inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, UI_SLOTS, EMBEDDINGS)
 
 
-async def apply(ctx: Context, config: object) -> None:
+async def apply(ctx: Context) -> None:
     """注册只读历史和生命周期；正式 Root 启动后才扫描消息与打开反馈库。"""
-    _ = config
+    await ctx.require(UI).register(
+        ctx, web="web_module.js",
+        dashboard=lambda: import_module(".dashboard", __package__),
+        requires=("workbench.panels.v2",),
+        provides=(),
+        contract_digests={
+            "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
+        },
+    )
     db_path = ctx.data_root / _FEEDBACK_DB_NAME
     runtime = ProactiveFeedbackRuntime(
         catalog=ctx.require(MESSAGE_CATALOG), projection=ctx.require(TURN_PROJECTION),

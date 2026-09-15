@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 
 from agent.plugins.composable import ComposablePlugin
+from agent.plugins.manager import PluginManager
+from agent.plugins.static_manifest import load_static_plugin_manifest
+from bus.event_bus import EventBus
 from plugins.content.plugin import check_text
 from plugins.turn_projection.plugin import TurnProjection
 from session.log import MessageCatalog, MessageLog, SessionAttributes
@@ -82,10 +85,11 @@ def _runtime(log: MessageLog, db_path: Path):
 
 
 def test_module_uses_message_runtime_contract() -> None:
-    loaded = ComposablePlugin.from_module(feedback)
+    manifest = load_static_plugin_manifest(Path(__file__).parents[1])
+    loaded = ComposablePlugin.from_module(feedback, manifest)
     assert loaded.name == "proactive_feedback"
     assert loaded.version == "4.0.1"
-    assert inspect.signature(feedback.apply).parameters.keys() == {"ctx", "config"}
+    assert inspect.signature(feedback.apply).parameters.keys() == {"ctx"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
         "AFTER_TURN_COMMITTED", "TurnCommitted", "SESSION_READ",
@@ -288,7 +292,36 @@ async def test_history_discovery_yields_between_turns(
 async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    host, store, log, _artifacts, sources = environment(tmp_path, reply=True)
+    host, store, log, artifacts, sources = environment(tmp_path, reply=True)
+    # 真实 models 插件已提供 EMBEDDINGS；测试探针接管同一服务前须先摘除原注册。
+    models_entry = sources / "models" / "plugin.py"
+    models_entry.write_text(
+        models_entry.read_text(encoding="utf-8").replace(
+            "_ = await ctx.provide(EMBEDDINGS, state.embeddings)",
+            "_ = state.embeddings",
+        ),
+        encoding="utf-8",
+    )
+    embeddings = sources / "embeddings_probe"
+    embeddings.mkdir()
+    (embeddings / "plugin.py").write_text('''
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from agent.plugin_composition import EMBEDDINGS
+api_version = 3
+name = "embeddings_probe"
+version = "1.0.0"
+inject = ()
+class Bound:
+    async def embed(self, texts):
+        return SimpleNamespace(vectors=tuple((1.0, 0.0) for _ in texts))
+class Embeddings:
+    @asynccontextmanager
+    async def bind(self):
+        yield Bound()
+async def apply(ctx):
+    await ctx.provide(EMBEDDINGS, Embeddings())
+''', encoding="utf-8")
     shutil.copytree(
         Path(__file__).parents[1], sources / "proactive_feedback",
         ignore=shutil.ignore_patterns(
@@ -315,6 +348,14 @@ async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
         ).records) == 1
 
         await host.terminate_all()
+        host = PluginManager(
+            [sources],
+            event_bus=EventBus(),
+            workspace=tmp_path / "workspace",
+            installed_cache_root=tmp_path / "cache",
+            message_log=log,
+            channel_attachment_store=artifacts,
+        )
         await host.load_all()
         await host.start_runtime()
         await asyncio.sleep(0.05)
