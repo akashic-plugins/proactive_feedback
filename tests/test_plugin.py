@@ -13,13 +13,13 @@ import pytest
 
 from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manager import PluginManager
+from agent.plugins.selection import PluginSelection
 from agent.plugins.static_manifest import load_static_plugin_manifest
 from bus.event_bus import EventBus
 from plugins.content.plugin import check_text
 from plugins.turn_projection.plugin import TurnProjection
 from session.log import MessageCatalog, MessageLog, SessionAttributes
 from session.message import ContentPart, ContentReferences, Input, Message, Output
-from tests.test_standard_tools import environment
 
 
 def _load_plugin():
@@ -292,16 +292,10 @@ async def test_history_discovery_yields_between_turns(
 async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    host, store, log, artifacts, sources = environment(tmp_path, reply=True)
-    # 真实 models 插件已提供 EMBEDDINGS；测试探针接管同一服务前须先摘除原注册。
-    models_entry = sources / "models" / "plugin.py"
-    models_entry.write_text(
-        models_entry.read_text(encoding="utf-8").replace(
-            "_ = await ctx.provide(EMBEDDINGS, state.embeddings)",
-            "_ = state.embeddings",
-        ),
-        encoding="utf-8",
-    )
+    sources = tmp_path / "plugins"
+    core_plugins = Path(__import__("plugins.ui.plugin", fromlist=["x"]).__file__).parents[1]
+    for name in ("turn_projection", "ui"):
+        shutil.copytree(core_plugins / name, sources / name)
     embeddings = sources / "embeddings_probe"
     embeddings.mkdir()
     (embeddings / "plugin.py").write_text('''
@@ -327,6 +321,14 @@ async def apply(ctx):
         ignore=shutil.ignore_patterns(
             ".git", ".pytest_cache", "__pycache__", "tests", ".akashic-core", ".plugin-contracts",
         ),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    PluginSelection(workspace).initialize()
+    log = MessageLog(tmp_path / "sessions.db")
+    host = PluginManager(
+        [sources], event_bus=EventBus(), workspace=workspace,
+        installed_cache_root=tmp_path / "cache", message_log=log,
     )
     try:
         await host.load_all()
@@ -354,7 +356,6 @@ async def apply(ctx):
             workspace=tmp_path / "workspace",
             installed_cache_root=tmp_path / "cache",
             message_log=log,
-            channel_attachment_store=artifacts,
         )
         await host.load_all()
         await host.start_runtime()
@@ -365,15 +366,14 @@ async def apply(ctx):
     finally:
         await host.terminate_all()
         log.close()
-        store.close()
 
 
-def test_mobile_projection_rejects_unknown_method_without_writing(tmp_path: Path) -> None:
+def test_plugin_ui_projection_rejects_unknown_method_without_writing(tmp_path: Path) -> None:
     log = MessageLog(tmp_path / "sessions.db")
     try:
         runtime = _runtime(log, tmp_path / "missing" / "proactive_feedback.db")
-        with pytest.raises(feedback.MobileUiRpcInvalidRequest):
-            runtime.query_mobile("feedback.delete", {}, session_id=None, turn_id=None)
+        with pytest.raises(feedback.PluginUiRpcInvalidRequest):
+            runtime.query_plugin_ui("feedback.delete", {}, session_id=None, turn_id=None)
         assert not runtime._db_path.exists()
     finally:
         log.close()
