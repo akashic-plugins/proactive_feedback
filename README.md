@@ -64,11 +64,11 @@ python scripts/migrate_feedback_previews.py \
 插件不声明 EventBus listener、`TurnCommitted` 或旧 Session snapshot ABI；运行路径只消费
 Message 与无状态 Turn 投影，并通过上述只读 history service 暴露已持久化反馈。
 
-## 移动端看板
+## Web 插件界面
 
-插件通过 Akashic 的通用移动 UI 生命周期注册“主动反馈”入口，不要求 Agent 核心识别
+插件通过 Akashic 的通用 Plugin UI 生命周期注册“主动反馈”入口，不要求 Agent 核心识别
 插件业务。看板聚焦主动消息是否被继续、明确引用和高可信信号；事件展开后按“主动发出、
-用户回应、助手继续”显示关联链路。桌面 Dashboard 保留完整审计字段，移动端不复制桌面
+用户回应、助手继续”显示关联链路。桌面 Dashboard 保留完整审计字段，Web 插件界面不复制桌面
 表格。
 
 历史消息的读取、解码与 Turn 投影在工作线程执行，避免启动追赶阻塞聊天和心跳。已有 accepted feedback 的身份直接补齐 inbox 回执，不重新评分或改写历史反馈。
