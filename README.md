@@ -4,11 +4,11 @@ Akashic proactive feedback plugin.
 
 ## Message runtime 接入
 
-插件入口是 module-level `api_version = 3` 与 `apply(ctx, config)`：
+插件入口是 module-level `api_version = 3` 与 `apply(ctx)`：
 
 - 通过 `core.message_catalog` 追赶已提交 Message head，并用 `turn.projection.v1`
   从完整前缀识别已完成回复；
-- 反馈数据库由 Core 分配的 `ctx.data_root` 独占，Dashboard 与 Web 插件界面 只读同一投影；
+- 反馈数据库由 Core 分配的 `ctx.data_root` 独占，Dashboard 与 Web 插件界面只读同一投影；
 - `apply` 不读取或写入正式 Message 数据；候选期不会启动 watcher。正式 generation
   启动后从 Core 目录重扫列出的 Session，只把 ordered input IDs、ending output ID
   和 Session identity 写入 inbox，正文只在评分内存中从 Message 重建。
