@@ -3,15 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from importlib import import_module
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
 from agent.plugin_composition import (
-    Context, EMBEDDINGS, Embeddings, MobileUiDefinition, MobileUiNavigation,
-    MobileUiRpcInvalidRequest, RUNTIME_STARTED, RUNTIME_STOPPING, UI_SLOTS,
+    Context, EMBEDDINGS, Embeddings, PluginUiDefinition, PluginUiNavigation,
+    PluginUiRpcInvalidRequest, RUNTIME_STARTED, RUNTIME_STOPPING, UI_SLOTS,
 )
 from agent.plugin_composition.messages import MESSAGE_CATALOG
+from agent.plugin_composition.ui import UI
 from agent.plugin_contracts import Input, Message, Output
 
 from .contracts import MessageCatalog, TURN_PROJECTION, TurnProjection
@@ -36,22 +38,20 @@ name = "proactive_feedback"
 version = "4.0.1"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
-inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI_SLOTS, EMBEDDINGS)
-skill_roots: tuple[str, ...] = ()
-drift_skill_roots: tuple[str, ...] = ()
-workspace_roots: tuple[str, ...] = ()
-dashboard_module = "dashboard.py"
-web_module = "web_module.js"
-web_requires = ("workbench.panels.v2",)
-web_provides = ()
-web_contract_digests = {
-    "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
-}
+inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, UI_SLOTS, EMBEDDINGS)
 
 
-async def apply(ctx: Context, config: object) -> None:
+async def apply(ctx: Context) -> None:
     """注册只读历史和生命周期；正式 Root 启动后才扫描消息与打开反馈库。"""
-    _ = config
+    await ctx.require(UI).register(
+        ctx, web="web_module.js",
+        dashboard=lambda: import_module(".dashboard", __package__),
+        requires=("workbench.panels.v2",),
+        provides=(),
+        contract_digests={
+            "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
+        },
+    )
     db_path = ctx.data_root / _FEEDBACK_DB_NAME
     runtime = ProactiveFeedbackRuntime(
         catalog=ctx.require(MESSAGE_CATALOG), projection=ctx.require(TURN_PROJECTION),
@@ -73,15 +73,15 @@ async def apply(ctx: Context, config: object) -> None:
 
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)
-    await ctx.require(UI_SLOTS).register_mobile(
+    await ctx.require(UI_SLOTS).register_plugin_ui(
         ctx,
-        MobileUiDefinition(
-            module="mobile_panel.js", stylesheet="mobile_panel.css",
-            navigation=MobileUiNavigation(
+        PluginUiDefinition(
+            module="plugin_ui.js", stylesheet="plugin_ui.css",
+            navigation=PluginUiNavigation(
                 label="主动反馈", description="主动消息是否被继续，以及对应的回应链路",
             ),
         ),
-        query=runtime.query_mobile,
+        query=runtime.query_plugin_ui,
     )
 
 
@@ -295,22 +295,22 @@ class ProactiveFeedbackRuntime:
         finally:
             sink.close()
 
-    def query_mobile(self, method: str, payload: dict[str, object], *,
+    def query_plugin_ui(self, method: str, payload: dict[str, object], *,
                      session_id: str | None, turn_id: str | None) -> dict[str, object]:
-        """返回当前 generation 的只读移动投影。"""
+        """返回当前 generation 的只读 Web 界面投影。"""
         _ = session_id, turn_id
         if method not in {"feedback.overview", "feedback.events"}:
-            raise MobileUiRpcInvalidRequest(f"未知 proactive_feedback 移动方法: {method}")
+            raise PluginUiRpcInvalidRequest(f"未知 proactive_feedback 插件界面方法: {method}")
         reader = ProactiveFeedbackDashboardReader(self._db_path.parent)
         if method == "feedback.overview":
             if payload:
-                raise MobileUiRpcInvalidRequest("feedback.overview 不接受参数")
+                raise PluginUiRpcInvalidRequest("feedback.overview 不接受参数")
             return reader.get_overview()
         if set(payload) - {"page", "page_size", "feedback_type"}:
-            raise MobileUiRpcInvalidRequest("feedback.events 参数无效")
-        page = _mobile_page_value(payload, "page", default=1, maximum=10_000)
-        page_size = _mobile_page_value(payload, "page_size", default=30, maximum=50)
-        feedback_type = _mobile_feedback_type(payload)
+            raise PluginUiRpcInvalidRequest("feedback.events 参数无效")
+        page = _ui_page_value(payload, "page", default=1, maximum=10_000)
+        page_size = _ui_page_value(payload, "page_size", default=30, maximum=50)
+        feedback_type = _ui_feedback_type(payload)
         items, total = reader.list_events(
             page=page, page_size=page_size, feedback_type=feedback_type,
         )
@@ -350,19 +350,19 @@ async def _no_embed(texts: list[str]) -> list[list[float]]:
     raise RuntimeError("显式引用反馈不得调用 embedding")
 
 
-def _mobile_page_value(payload: dict[str, object], name: str, *,
+def _ui_page_value(payload: dict[str, object], name: str, *,
                        default: int, maximum: int) -> int:
     value = payload.get(name, default)
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
-        raise MobileUiRpcInvalidRequest(f"{name} 必须是 1 到 {maximum} 的整数")
+        raise PluginUiRpcInvalidRequest(f"{name} 必须是 1 到 {maximum} 的整数")
     return value
 
 
-def _mobile_feedback_type(payload: dict[str, object]) -> str:
+def _ui_feedback_type(payload: dict[str, object]) -> str:
     value = payload.get("feedback_type", "")
     if not isinstance(value, str):
-        raise MobileUiRpcInvalidRequest("feedback_type 必须是字符串")
+        raise PluginUiRpcInvalidRequest("feedback_type 必须是字符串")
     allowed = {"", "topic_follow", "explicit_quote", "no_topic_follow", "unscored"}
     if value not in allowed:
-        raise MobileUiRpcInvalidRequest("feedback_type 不受支持")
+        raise PluginUiRpcInvalidRequest("feedback_type 不受支持")
     return value

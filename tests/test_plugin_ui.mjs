@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const source = await readFile(new URL("../mobile_panel.js", import.meta.url), "utf8");
-const styles = await readFile(new URL("../mobile_panel.css", import.meta.url), "utf8");
+const source = await readFile(new URL("../plugin_ui.js", import.meta.url), "utf8");
+const styles = await readFile(new URL("../plugin_ui.css", import.meta.url), "utf8");
 const panel = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 
 class FakeElement {
@@ -93,7 +93,7 @@ class DashboardHost extends FakeElement {
   }
 }
 
-test("mobile navigation describes the proactive feedback task", () => {
+test("plugin UI navigation describes the proactive feedback task", () => {
   assert.equal(panel.default.navigation.label, "主动反馈");
   assert.match(panel.default.navigation.description, /是否被继续/);
   assert.equal(typeof panel.default.dashboard.mount, "function");
@@ -112,14 +112,14 @@ test("feedback types keep stable semantic labels and tones", () => {
   assert.equal(panel.feedbackTone("unscored"), "uncertain");
 });
 
-test("mobile panel keeps content in plugin-owned module", () => {
+test("plugin UI panel keeps content in plugin-owned module", () => {
   assert.match(source, /主动发出/);
   assert.match(source, /用户回应/);
   assert.match(source, /助手继续/);
   assert.doesNotMatch(source, /window\.AkashicDashboard/);
 });
 
-test("mobile panel inherits semantic colors from the shared Material theme", () => {
+test("plugin UI panel inherits semantic colors from the shared Material theme", () => {
   assert.match(styles, /var\(--ak-sys-color-success-container\)/);
   assert.match(styles, /var\(--ak-sys-color-on-success-container\)/);
   assert.match(styles, /var\(--ak-sys-color-trace-container\)/);

@@ -12,11 +12,14 @@ from pathlib import Path
 import pytest
 
 from agent.plugins.composable import ComposablePlugin
+from agent.plugins.manager import PluginManager
+from agent.plugins.selection import PluginSelection
+from agent.plugins.static_manifest import load_static_plugin_manifest
+from bus.event_bus import EventBus
 from plugins.content.plugin import check_text
 from plugins.turn_projection.plugin import TurnProjection
 from session.log import MessageCatalog, MessageLog, SessionAttributes
 from session.message import ContentPart, ContentReferences, Input, Message, Output
-from tests.test_standard_tools import environment
 
 
 def _load_plugin():
@@ -82,10 +85,11 @@ def _runtime(log: MessageLog, db_path: Path):
 
 
 def test_module_uses_message_runtime_contract() -> None:
-    loaded = ComposablePlugin.from_module(feedback)
+    manifest = load_static_plugin_manifest(Path(__file__).parents[1])
+    loaded = ComposablePlugin.from_module(feedback, manifest)
     assert loaded.name == "proactive_feedback"
     assert loaded.version == "4.0.1"
-    assert inspect.signature(feedback.apply).parameters.keys() == {"ctx", "config"}
+    assert inspect.signature(feedback.apply).parameters.keys() == {"ctx"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
         "AFTER_TURN_COMMITTED", "TurnCommitted", "SESSION_READ",
@@ -288,12 +292,43 @@ async def test_history_discovery_yields_between_turns(
 async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    host, store, log, _artifacts, sources = environment(tmp_path, reply=True)
+    sources = tmp_path / "plugins"
+    core_plugins = Path(__import__("plugins.ui.plugin", fromlist=["x"]).__file__).parents[1]
+    for name in ("turn_projection", "ui"):
+        shutil.copytree(core_plugins / name, sources / name)
+    embeddings = sources / "embeddings_probe"
+    embeddings.mkdir()
+    (embeddings / "plugin.py").write_text('''
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from agent.plugin_composition import EMBEDDINGS
+api_version = 3
+name = "embeddings_probe"
+version = "1.0.0"
+inject = ()
+class Bound:
+    async def embed(self, texts):
+        return SimpleNamespace(vectors=tuple((1.0, 0.0) for _ in texts))
+class Embeddings:
+    @asynccontextmanager
+    async def bind(self):
+        yield Bound()
+async def apply(ctx):
+    await ctx.provide(EMBEDDINGS, Embeddings())
+''', encoding="utf-8")
     shutil.copytree(
         Path(__file__).parents[1], sources / "proactive_feedback",
         ignore=shutil.ignore_patterns(
             ".git", ".pytest_cache", "__pycache__", "tests", ".akashic-core", ".plugin-contracts",
         ),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    PluginSelection(workspace).initialize()
+    log = MessageLog(tmp_path / "sessions.db")
+    host = PluginManager(
+        [sources], event_bus=EventBus(), workspace=workspace,
+        installed_cache_root=tmp_path / "cache", message_log=log,
     )
     try:
         await host.load_all()
@@ -315,6 +350,13 @@ async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
         ).records) == 1
 
         await host.terminate_all()
+        host = PluginManager(
+            [sources],
+            event_bus=EventBus(),
+            workspace=tmp_path / "workspace",
+            installed_cache_root=tmp_path / "cache",
+            message_log=log,
+        )
         await host.load_all()
         await host.start_runtime()
         await asyncio.sleep(0.05)
@@ -324,15 +366,14 @@ async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
     finally:
         await host.terminate_all()
         log.close()
-        store.close()
 
 
-def test_mobile_projection_rejects_unknown_method_without_writing(tmp_path: Path) -> None:
+def test_plugin_ui_projection_rejects_unknown_method_without_writing(tmp_path: Path) -> None:
     log = MessageLog(tmp_path / "sessions.db")
     try:
         runtime = _runtime(log, tmp_path / "missing" / "proactive_feedback.db")
-        with pytest.raises(feedback.MobileUiRpcInvalidRequest):
-            runtime.query_mobile("feedback.delete", {}, session_id=None, turn_id=None)
+        with pytest.raises(feedback.PluginUiRpcInvalidRequest):
+            runtime.query_plugin_ui("feedback.delete", {}, session_id=None, turn_id=None)
         assert not runtime._db_path.exists()
     finally:
         log.close()
