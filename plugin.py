@@ -4,9 +4,10 @@ import asyncio
 import logging
 import sqlite3
 from importlib import import_module
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import closing
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 from agent.plugin_composition import (
     Context, EMBEDDINGS, Embeddings, PluginUiDefinition, PluginUiNavigation,
@@ -15,6 +16,7 @@ from agent.plugin_composition import (
 from agent.plugin_composition.messages import MESSAGE_CATALOG
 from agent.plugin_composition.ui import UI
 from agent.plugin_contracts import Input, Message, Output
+from core.common.file_io import run_file_io
 
 from .contracts import MessageCatalog, TURN_PROJECTION, TurnProjection
 from .dashboard import ProactiveFeedbackDashboardReader
@@ -32,6 +34,7 @@ logger = logging.getLogger("plugin.proactive_feedback")
 _FEEDBACK_DB_NAME = "proactive_feedback.db"
 _PREVIEW_MAX_CHARS = 2400
 _RETRY_SECONDS = 1.0
+T = TypeVar("T")
 
 api_version = 3
 name = "proactive_feedback"
@@ -94,6 +97,17 @@ class ProactiveFeedbackRuntime:
         self._embed_batch = embed_batch
         self._db_path = db_path
         self._heads: dict[str, int] = {}
+        self._store_lock = asyncio.Lock()
+
+    async def _store_io(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        """独占本代的一笔数据库工作，实际连接关闭后才释放准入锁。"""
+        def work() -> T:
+            with closing(open_db(self._db_path)) as sink:
+                return operation(sink)
+
+        # 原本由同步 loop 串行的数据库工作仍串行，初始化不会被评分读取抢过。
+        async with self._store_lock:
+            return await run_file_io(work)
 
     async def follow(self) -> None:
         """独立追赶 Message head 与重试耐久 inbox，避免评分失败重扫历史。"""
@@ -129,27 +143,24 @@ class ProactiveFeedbackRuntime:
 
     async def _discover_changed(self, heads: Mapping[str, int]) -> None:
         """只按 Core 目录选择列出的 Session；每个完整前缀可安全重复投影。"""
-        attributes = self._catalog.snapshot_attributes()
-        sink = open_db(self._db_path)
-        try:
-            for session_id, head in heads.items():
-                if self._heads.get(session_id) == head:
-                    continue
-                session_attributes = attributes.get(session_id)
-                if session_attributes is None or session_attributes.visibility != "listed":
-                    continue
-                messages = await asyncio.to_thread(
-                    self._catalog.reader(session_id).snapshot, through_seq=head,
-                )
-                await self._discover_session(sink, session_id, messages)
-        finally:
-            sink.close()
+        # 1. 保留空目录初始化；连接的完整寿命只在物理 worker 内。
+        await self._store_io(lambda _sink: None)
+        attributes = await run_file_io(self._catalog.snapshot_attributes)
+        for session_id, head in heads.items():
+            if self._heads.get(session_id) == head:
+                continue
+            session_attributes = attributes.get(session_id)
+            if session_attributes is None or session_attributes.visibility != "listed":
+                continue
+            reader = self._catalog.reader(session_id)
+            messages = await run_file_io(lambda: reader.snapshot(through_seq=head))
+            await self._discover_session(session_id, messages)
 
-    async def _discover_session(self, sink: sqlite3.Connection, session_id: str,
+    async def _discover_session(self, session_id: str,
                                 messages: tuple[Message, ...]) -> None:
         """把含用户输入与最终输出的完整 Turn 身份写入插件 inbox。"""
         # 1. 每个前缀只建一次候选索引，避免每个 Turn 重新扫描历史。
-        rows = await asyncio.to_thread(message_rows_from_messages, messages)
+        rows = await run_file_io(lambda: message_rows_from_messages(messages))
         candidates = CandidateIndex(rows)
         by_id = {message.message_id: message for message in messages}
         row_by_id = {row.id: row for row in rows}
@@ -157,7 +168,7 @@ class ProactiveFeedbackRuntime:
             message.source for message in messages if isinstance(message.body, Input)
         ))
         for source in sources:
-            turns = await asyncio.to_thread(self._projection.project, messages, source)
+            turns = await run_file_io(lambda: self._projection.project(messages, source))
             for turn in turns:
                 # 2. 历史追赶必须让聊天、心跳和取消任务继续运行。
                 await asyncio.sleep(0)
@@ -173,14 +184,20 @@ class ProactiveFeedbackRuntime:
                 )
                 if not self._candidates(candidates, aggregate, users[0].seq):
                     continue
-                insert_feedback_input(
-                    sink, session_key=session_id,
-                    turn_id=turn.ending_message_id,
-                    client_message_id=users[0].message_id,
-                    user_message_id=users[-1].message_id,
-                    user_message_ids=tuple(message.message_id for message in users),
-                    assistant_message_id=assistant.message_id,
-                )
+                # 3. 每次只接纳一个 Turn，取消先等本次提交，后续 Turn 不再开始。
+                ending_id = turn.ending_message_id
+                user_ids = tuple(message.message_id for message in users)
+                def write_input(sink: sqlite3.Connection) -> None:
+                    insert_feedback_input(
+                        sink, session_key=session_id,
+                        turn_id=ending_id,
+                        client_message_id=user_ids[0],
+                        user_message_id=user_ids[-1],
+                        user_message_ids=user_ids,
+                        assistant_message_id=ending_id,
+                    )
+
+                await self._store_io(write_input)
 
     @staticmethod
     def _candidates(index: CandidateIndex, user: MessageRow,
@@ -192,32 +209,29 @@ class ProactiveFeedbackRuntime:
 
     async def _process_pending_inputs(self) -> bool:
         """按 inbox 顺序处理；缺失的权威 Message 保留到后续日志变化。"""
-        if not self._db_path.exists():
+        if not await run_file_io(self._db_path.exists):
             return False
-        sink = open_db(self._db_path)
-        try:
-            pending = pending_feedback_inputs(sink, limit=100)
-        finally:
-            sink.close()
+        pending = await self._store_io(lambda sink: pending_feedback_inputs(sink, limit=100))
         results = [await self._process_record(record) for record in pending]
         return bool(results) and not all(results)
 
     async def _process_record(self, record: FeedbackInputRecord) -> bool:
         """恢复已接受反馈的 inbox 回执；只有新身份才读取历史并评分。"""
         # 1. accepted payload 已经是权威结果，重启不能重新评分或覆盖它。
-        sink = open_db(self._db_path)
-        try:
+        def recover_accepted(sink: sqlite3.Connection) -> bool:
             if feedback_identity_exists(
                 sink, session_key=record.session_key, user_message_id=record.user_message_id,
             ):
                 mark_feedback_input_processed(sink, row_id=record.row_id)
                 return True
-        finally:
-            sink.close()
+            return False
+
+        if await self._store_io(recover_accepted):
+            return True
 
         # 2. 完整历史解码在工作线程完成，不能拖住聊天和 Host Bridge 心跳。
-        messages = await asyncio.to_thread(self._catalog.reader(record.session_key).snapshot)
-        rows = await asyncio.to_thread(message_rows_from_messages, messages)
+        messages = await run_file_io(self._catalog.reader(record.session_key).snapshot)
+        rows = await run_file_io(lambda: message_rows_from_messages(messages))
         by_id = {row.id: row for row in rows}
         try:
             user_rows = [by_id[message_id] for message_id in record.user_message_ids]
@@ -235,7 +249,7 @@ class ProactiveFeedbackRuntime:
         user = _aggregate_user_rows(user_rows)
         candidates = self._candidates(CandidateIndex(rows), user, user_rows[0].seq)
         if not candidates:
-            self._complete(record.row_id)
+            await self._complete(record.row_id)
             return True
         quote = parse_quote_parts(user.content)
         explicit = bool(user.reply_to_id or quote.quoted_text)
@@ -263,14 +277,13 @@ class ProactiveFeedbackRuntime:
                     candidate_count=scored.candidate_count,
                     matched_by=scored.matched_by, reason=scored.reason,
                 )
-        self._complete(record.row_id)
+        await self._complete(record.row_id)
         return True
 
     async def _persist_feedback(self, record: FeedbackInputRecord, user: MessageRow,
                                 assistant: MessageRow, proactive: MessageRow,
                                 **score: object) -> None:
-        sink = open_db(self._db_path)
-        try:
+        def save(sink: sqlite3.Connection) -> None:
             _ = insert_feedback(sink, FeedbackEvent(
                 session_key=record.session_key, user_message_id=user.id,
                 assistant_message_id=assistant.id, proactive_message_id=proactive.id,
@@ -285,15 +298,12 @@ class ProactiveFeedbackRuntime:
                 assistant_content_preview=_bounded_preview(assistant.content),
                 proactive_content_preview=_bounded_preview(proactive.content),
             ))
-        finally:
-            sink.close()
 
-    def _complete(self, row_id: int) -> None:
-        sink = open_db(self._db_path)
-        try:
-            mark_feedback_input_processed(sink, row_id=row_id)
-        finally:
-            sink.close()
+        await self._store_io(save)
+
+    async def _complete(self, row_id: int) -> None:
+        """确认单条处理回执，取消后也等待真实提交与连接关闭。"""
+        await self._store_io(lambda sink: mark_feedback_input_processed(sink, row_id=row_id))
 
     def query_plugin_ui(self, method: str, payload: dict[str, object], *,
                      session_id: str | None, turn_id: str | None) -> dict[str, object]:

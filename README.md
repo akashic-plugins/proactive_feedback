@@ -72,3 +72,9 @@ Message 与无状态 Turn 投影，并通过上述只读 history service 暴露�
 表格。
 
 历史消息的读取、解码与 Turn 投影在工作线程执行，避免启动追赶阻塞聊天和心跳。已有 accepted feedback 的身份直接补齐 inbox 回执，不重新评分或改写历史反馈。
+
+后台发现、评分和结算的 SQLite 工作通过 Core 的有界文件执行路径完成。每次连接、完整事务和关闭都在同一物理工作内；连接不跨 await 或线程传递。发现仍逐 Turn 接纳，取消先等当前物理工作结束，后续 Turn 不再开始；已提交 inbox/accepted feedback 按原身份恢复。没有新增 schema、队列、反馈改写或数据清理。
+
+同一 Runtime 的数据库准入保持串行；不同 Runtime 共用数据库时，反馈归属核对、原 payload 校验和首次 accepted 写入在同一 SQLite 写事务内完成，不能各自接受第二份 payload。
+
+隔离数据库锁、取消与重开场景可运行 `PYTHONPATH=/path/to/core python scripts/check_store_io.py`；脚本只使用临时 MessageLog 与反馈库，不调用付费模型或正式 workspace。
