@@ -60,6 +60,17 @@ def open_db(path: Path) -> sqlite3.Connection:
     if existed:
         _prepare_schema_backup(path)
     conn = sqlite3.connect(path)
+    try:
+        _initialize_db(conn)
+    except BaseException:
+        # 初始化失败仍由连接 owner 关闭资源，原错误继续向上传递。
+        conn.close()
+        raise
+    return conn
+
+
+def _initialize_db(conn: sqlite3.Connection) -> None:
+    """在已获授的连接内初始化原 schema 与持久化设置，不转移连接 owner。"""
     conn.row_factory = sqlite3.Row
     _ = conn.execute("PRAGMA journal_mode = WAL")
     _ = conn.execute("PRAGMA synchronous = FULL")
@@ -140,30 +151,32 @@ def open_db(path: Path) -> sqlite3.Connection:
     _ensure_column(conn, "proactive_content_preview")
     _migrate_schema(conn)
     conn.commit()
-    return conn
 
 
 def insert_feedback(conn: sqlite3.Connection, event: FeedbackEvent) -> int | None:
     """Append one immutable accepted feedback fact or verify an exact duplicate."""
 
-    # 1. Reject a proactive message already owned by another user reply.
-    if _feedback_owned_by_other(conn, event):
-        return None
-
-    # 2. The first accepted payload owns the Turn identity forever.
-    existing = _existing_feedback(conn, event)
-    if existing is not None:
-        expected_hash = accepted_payload_hash(_accepted_payload(event))
-        actual_hash = accepted_payload_hash(_accepted_payload_from_row(existing))
-        if actual_hash != expected_hash:
-            raise RuntimeError(
-                "accepted feedback payload 漂移: "
-                f"proactive_feedback:{int(existing['id'])}"
-            )
-        return int(existing["id"])
-
-    # 3. Append the accepted fact without touching the frozen legacy outbox.
     try:
+        # 1. 两个 generation 的物理 worker 也必须在同一事务内决定首次 owner。
+        conn.execute("BEGIN IMMEDIATE")
+        if _feedback_owned_by_other(conn, event):
+            conn.rollback()
+            return None
+
+        # 2. 首次 accepted payload 保持原身份；另一 payload 不得成为第二条事实。
+        existing = _existing_feedback(conn, event)
+        if existing is not None:
+            expected_hash = accepted_payload_hash(_accepted_payload(event))
+            actual_hash = accepted_payload_hash(_accepted_payload_from_row(existing))
+            if actual_hash != expected_hash:
+                raise RuntimeError(
+                    "accepted feedback payload 漂移: "
+                    f"proactive_feedback:{int(existing['id'])}"
+                )
+            conn.commit()
+            return int(existing["id"])
+
+        # 3. 只追加原反馈事实，旧 outbox/cursor 不变。
         row_id = _insert_feedback_row(conn, event)
         conn.commit()
     except (sqlite3.Error, RuntimeError, TypeError, ValueError):

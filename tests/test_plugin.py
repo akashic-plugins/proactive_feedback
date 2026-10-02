@@ -224,8 +224,8 @@ async def test_scoring_failure_does_not_repeat_discovery_or_block_new_heads(
     discover = runtime._discover_session
     attempts = 0
 
-    async def record_discovery(sink, session_id, messages):
-        await discover(sink, session_id, messages)
+    async def record_discovery(session_id, messages):
+        await discover(session_id, messages)
         discovered.append(session_id)
         if session_id == "akashic:second":
             complete.set()
@@ -270,12 +270,13 @@ async def test_history_discovery_yields_between_turns(
         first_written = asyncio.Event()
         writes = 0
         insert = feedback.insert_feedback_input
+        loop = asyncio.get_running_loop()
 
         def record_insert(*args, **kwargs):
             nonlocal writes
             result = insert(*args, **kwargs)
             writes += 1
-            first_written.set()
+            loop.call_soon_threadsafe(first_written.set)
             return result
 
         monkeypatch.setattr(feedback, "insert_feedback_input", record_insert)
@@ -421,7 +422,7 @@ async def test_restart_acks_accepted_feedback_without_rescoring(tmp_path: Path, 
         first = _runtime(log, db_path)
         await first._discover_changed(dict(first._catalog.snapshot_heads()))
 
-        def crash_before_ack(_row_id):
+        async def crash_before_ack(_row_id):
             raise RuntimeError("crash before inbox ack")
 
         monkeypatch.setattr(first, "_complete", crash_before_ack)
