@@ -6,6 +6,7 @@ import inspect
 import shutil
 import sqlite3
 import sys
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -87,7 +88,7 @@ def test_module_uses_message_runtime_contract() -> None:
     manifest = load_static_plugin_manifest(Path(__file__).parents[1])
     loaded = ComposablePlugin.from_module(feedback, manifest)
     assert loaded.name == "proactive_feedback"
-    assert loaded.version == "4.0.2"
+    assert loaded.version == "4.0.3"
     assert inspect.signature(feedback.apply).parameters.keys() == {"ctx"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
@@ -334,17 +335,22 @@ async def apply(ctx):
         await host.load_all()
         await host.start_runtime()
         _append_turn(log)
-        db_paths = list((tmp_path / "workspace" / "plugin-data").glob(
-            "proactive_feedback-*/proactive_feedback.db"
-        ))
         async with asyncio.timeout(3):
-            while not db_paths or not feedback.SqliteFeedbackHistory(db_paths[0]).page(
-                after_cursor=0, max_items=10,
-            ).records:
-                await asyncio.sleep(0.01)
-                db_paths = list((tmp_path / "workspace" / "plugin-data").glob(
+            while True:
+                db_paths = list((workspace / "plugin-data").glob(
                     "proactive_feedback-*/proactive_feedback.db"
                 ))
+                if db_paths:
+                    # 文件先于 schema 出现；只读等待 owner 提交后再调用严格历史 reader。
+                    with closing(sqlite3.connect(db_paths[0].as_uri() + "?mode=ro", uri=True)) as probe:
+                        initialized = probe.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_feedback_events'"
+                        ).fetchone() is not None
+                    if initialized and feedback.SqliteFeedbackHistory(db_paths[0]).page(
+                        after_cursor=0, max_items=10,
+                    ).records:
+                        break
+                await asyncio.sleep(0.01)
         assert len(feedback.SqliteFeedbackHistory(db_paths[0]).page(
             after_cursor=0, max_items=10,
         ).records) == 1

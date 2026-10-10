@@ -37,7 +37,7 @@ T = TypeVar("T")
 
 api_version = 3
 name = "proactive_feedback"
-version = "4.0.2"
+version = "4.0.3"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
 inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, UI_SLOTS, EMBEDDINGS)
@@ -46,13 +46,7 @@ inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, UI_SLOTS, EMBEDDINGS)
 async def apply(ctx: Context) -> None:
     """注册只读历史和生命周期；正式 Root 启动后才扫描消息与打开反馈库。"""
     await ctx.require(UI).register(
-        ctx, web="web_module.js",
-        dashboard=lambda: import_module(".dashboard", __package__),
-        requires=("workbench.panels.v2",),
-        provides=(),
-        contract_digests={
-            "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
-        },
+        ctx, dashboard=lambda: import_module(".dashboard", __package__),
     )
     db_path = ctx.data_root / _FEEDBACK_DB_NAME
     runtime = ProactiveFeedbackRuntime(
