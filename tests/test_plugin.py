@@ -15,7 +15,6 @@ from agent.plugins.composable import ComposablePlugin
 from agent.plugins.manager import PluginManager
 from agent.plugins.selection import PluginSelection
 from agent.plugins.static_manifest import load_static_plugin_manifest
-from bus.event_bus import EventBus
 from plugins.content.plugin import check_text
 from plugins.turn_projection.plugin import TurnProjection
 from session.log import MessageCatalog, MessageLog, SessionAttributes
@@ -88,7 +87,7 @@ def test_module_uses_message_runtime_contract() -> None:
     manifest = load_static_plugin_manifest(Path(__file__).parents[1])
     loaded = ComposablePlugin.from_module(feedback, manifest)
     assert loaded.name == "proactive_feedback"
-    assert loaded.version == "4.0.1"
+    assert loaded.version == "4.0.2"
     assert inspect.signature(feedback.apply).parameters.keys() == {"ctx"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
@@ -302,7 +301,7 @@ async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
     (embeddings / "plugin.py").write_text('''
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from agent.plugin_composition import EMBEDDINGS
+from plugins.models.contract import EMBEDDINGS
 api_version = 3
 name = "embeddings_probe"
 version = "1.0.0"
@@ -328,7 +327,7 @@ async def apply(ctx):
     PluginSelection(workspace).initialize()
     log = MessageLog(tmp_path / "sessions.db")
     host = PluginManager(
-        [sources], event_bus=EventBus(), workspace=workspace,
+        [sources], workspace=workspace,
         installed_cache_root=tmp_path / "cache", message_log=log,
     )
     try:
@@ -353,7 +352,6 @@ async def apply(ctx):
         await host.terminate_all()
         host = PluginManager(
             [sources],
-            event_bus=EventBus(),
             workspace=tmp_path / "workspace",
             installed_cache_root=tmp_path / "cache",
             message_log=log,
