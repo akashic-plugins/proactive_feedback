@@ -9,12 +9,11 @@ from contextlib import closing
 from pathlib import Path
 from typing import TypeVar, cast
 
-from agent.plugin_composition import (
-    Context, EMBEDDINGS, Embeddings, PluginUiDefinition, PluginUiNavigation,
-    PluginUiRpcInvalidRequest, RUNTIME_STARTED, RUNTIME_STOPPING, UI_SLOTS,
-)
+from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING
+from plugins.models.contract import EMBEDDINGS, Embeddings
+from plugins.ui.contract import PluginUiDefinition, PluginUiNavigation, PluginUiRpcInvalidRequest, UI_SLOTS
 from agent.plugin_composition.messages import MESSAGE_CATALOG
-from agent.plugin_composition.ui import UI
+from plugins.ui.contract import UI
 from agent.plugin_contracts import Input, Message, Output
 from core.common.file_io import run_file_io
 
@@ -38,7 +37,7 @@ T = TypeVar("T")
 
 api_version = 3
 name = "proactive_feedback"
-version = "4.0.1"
+version = "4.0.2"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
 inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, UI_SLOTS, EMBEDDINGS)
