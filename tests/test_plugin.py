@@ -6,6 +6,7 @@ import inspect
 import shutil
 import sqlite3
 import sys
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -341,7 +342,7 @@ async def apply(ctx):
                 ))
                 if db_paths:
                     # 文件先于 schema 出现；只读等待 owner 提交后再调用严格历史 reader。
-                    with sqlite3.connect(db_paths[0].as_uri() + "?mode=ro", uri=True) as probe:
+                    with closing(sqlite3.connect(db_paths[0].as_uri() + "?mode=ro", uri=True)) as probe:
                         initialized = probe.execute(
                             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_feedback_events'"
                         ).fetchone() is not None
