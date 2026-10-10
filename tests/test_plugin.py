@@ -334,17 +334,22 @@ async def apply(ctx):
         await host.load_all()
         await host.start_runtime()
         _append_turn(log)
-        db_paths = list((tmp_path / "workspace" / "plugin-data").glob(
-            "proactive_feedback-*/proactive_feedback.db"
-        ))
         async with asyncio.timeout(3):
-            while not db_paths or not feedback.SqliteFeedbackHistory(db_paths[0]).page(
-                after_cursor=0, max_items=10,
-            ).records:
-                await asyncio.sleep(0.01)
-                db_paths = list((tmp_path / "workspace" / "plugin-data").glob(
+            while True:
+                db_paths = list((workspace / "plugin-data").glob(
                     "proactive_feedback-*/proactive_feedback.db"
                 ))
+                if db_paths:
+                    # 文件先于 schema 出现；只读等待 owner 提交后再调用严格历史 reader。
+                    with sqlite3.connect(db_paths[0].as_uri() + "?mode=ro", uri=True) as probe:
+                        initialized = probe.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='proactive_feedback_events'"
+                        ).fetchone() is not None
+                    if initialized and feedback.SqliteFeedbackHistory(db_paths[0]).page(
+                        after_cursor=0, max_items=10,
+                    ).records:
+                        break
+                await asyncio.sleep(0.01)
         assert len(feedback.SqliteFeedbackHistory(db_paths[0]).page(
             after_cursor=0, max_items=10,
         ).records) == 1
