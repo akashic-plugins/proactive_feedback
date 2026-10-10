@@ -37,7 +37,7 @@ T = TypeVar("T")
 
 api_version = 3
 name = "proactive_feedback"
-version = "4.0.2"
+version = "4.0.3"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
 inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, UI_SLOTS, EMBEDDINGS)
