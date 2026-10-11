@@ -12,12 +12,13 @@ from typing import TypeVar, cast
 from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING
 from plugins.models.contract import EMBEDDINGS, Embeddings
 from plugins.ui.contract import PluginUiDefinition, PluginUiNavigation, PluginUiRpcInvalidRequest, UI_SLOTS
-from agent.plugin_composition.messages import MESSAGE_CATALOG
+from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.ui.contract import UI
-from agent.plugin_contracts import Input, Message, Output
+from plugins.ledger.contract import Input, Message, Output
 from core.common.file_io import run_file_io
 
-from .contracts import MessageCatalog, TURN_PROJECTION, TurnProjection
+from plugins.ledger.contract import MessageCatalog
+from plugins.turn_projection.contract import TURN_PROJECTION, TurnProjection
 from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
     FeedbackEvent, FeedbackInputRecord, insert_feedback, insert_feedback_input,
