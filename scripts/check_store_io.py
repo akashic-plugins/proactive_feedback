@@ -19,8 +19,8 @@ from typing import Any
 
 from plugins.content.plugin import check_text
 from plugins.turn_projection.plugin import TurnProjection
-from session.log import MessageCatalog, MessageLog
-from session.message import ContentPart, ContentReferences, Input, Output
+from plugins.ledger.log import MessageCatalog, MessageLog
+from plugins.ledger.contract import ContentPart, ContentReferences, Input, Output
 
 
 def load_source(source: Path):

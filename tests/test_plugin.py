@@ -9,6 +9,7 @@ import sys
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -18,8 +19,9 @@ from agent.plugins.selection import PluginSelection
 from agent.plugins.static_manifest import load_static_plugin_manifest
 from plugins.content.plugin import check_text
 from plugins.turn_projection.plugin import TurnProjection
-from session.log import MessageCatalog, MessageLog, SessionAttributes
-from session.message import ContentPart, ContentReferences, Input, Message, Output
+from plugins.ledger.log import MessageCatalog, MessageLog, SessionAttributes
+from plugins.ledger.contract import MESSAGE_CATALOG
+from plugins.ledger.contract import ContentPart, ContentReferences, Input, Message, Output
 
 
 def _load_plugin():
@@ -295,7 +297,7 @@ async def test_real_plugin_manager_consumes_messages_and_restart_is_idempotent(
 ) -> None:
     sources = tmp_path / "plugins"
     core_plugins = Path(__import__("plugins.ui.plugin", fromlist=["x"]).__file__).parents[1]
-    for name in ("turn_projection", "ui"):
+    for name in ("ledger", "turn_projection", "ui"):
         shutil.copytree(core_plugins / name, sources / name)
     embeddings = sources / "embeddings_probe"
     embeddings.mkdir()
@@ -326,15 +328,14 @@ async def apply(ctx):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     PluginSelection(workspace).initialize()
-    log = MessageLog(tmp_path / "sessions.db")
-    host = PluginManager(
-        [sources], workspace=workspace,
-        installed_cache_root=tmp_path / "cache", message_log=log,
-    )
+    log = MessageLog(workspace / "sessions.db")
+    host = PluginManager([sources], workspace=workspace, installed_cache_root=tmp_path / 'cache')
     try:
         await host.load_all()
         await host.start_runtime()
-        _append_turn(log)
+        root = host.live_root
+        assert root is not None
+        _append_turn(cast(MessageCatalog, root.context.require(MESSAGE_CATALOG))._log)
         async with asyncio.timeout(3):
             while True:
                 db_paths = list((workspace / "plugin-data").glob(
@@ -356,12 +357,7 @@ async def apply(ctx):
         ).records) == 1
 
         await host.terminate_all()
-        host = PluginManager(
-            [sources],
-            workspace=tmp_path / "workspace",
-            installed_cache_root=tmp_path / "cache",
-            message_log=log,
-        )
+        host = PluginManager([sources], workspace=tmp_path / 'workspace', installed_cache_root=tmp_path / 'cache')
         await host.load_all()
         await host.start_runtime()
         await asyncio.sleep(0.05)
