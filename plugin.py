@@ -11,7 +11,6 @@ from typing import TypeVar, cast
 
 from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING
 from plugins.models.contract import EMBEDDINGS, Embeddings
-from plugins.ui.contract import PluginUiDefinition, PluginUiNavigation, PluginUiRpcInvalidRequest, UI_SLOTS
 from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.ui.contract import UI
 from plugins.ledger.contract import Input, Message, Output
@@ -19,7 +18,6 @@ from core.common.file_io import run_file_io
 
 from plugins.ledger.contract import MessageCatalog
 from plugins.turn_projection.contract import TURN_PROJECTION, TurnProjection
-from .dashboard import ProactiveFeedbackDashboardReader
 from .db import (
     FeedbackEvent, FeedbackInputRecord, insert_feedback, insert_feedback_input,
     feedback_identity_exists, mark_feedback_input_processed, open_db, pending_feedback_inputs,
@@ -38,10 +36,10 @@ T = TypeVar("T")
 
 api_version = 3
 name = "proactive_feedback"
-version = "4.0.3"
+version = "4.0.4"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
-inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, UI_SLOTS, EMBEDDINGS)
+inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, EMBEDDINGS)
 
 
 async def apply(ctx: Context) -> None:
@@ -70,16 +68,6 @@ async def apply(ctx: Context) -> None:
 
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)
-    await ctx.require(UI_SLOTS).register_plugin_ui(
-        ctx,
-        PluginUiDefinition(
-            module="plugin_ui.js", stylesheet="plugin_ui.css",
-            navigation=PluginUiNavigation(
-                label="主动反馈", description="主动消息是否被继续，以及对应的回应链路",
-            ),
-        ),
-        query=runtime.query_plugin_ui,
-    )
 
 
 class ProactiveFeedbackRuntime:
@@ -299,27 +287,6 @@ class ProactiveFeedbackRuntime:
         """确认单条处理回执，取消后也等待真实提交与连接关闭。"""
         await self._store_io(lambda sink: mark_feedback_input_processed(sink, row_id=row_id))
 
-    def query_plugin_ui(self, method: str, payload: dict[str, object], *,
-                     session_id: str | None, turn_id: str | None) -> dict[str, object]:
-        """返回当前 generation 的只读 Web 界面投影。"""
-        _ = session_id, turn_id
-        if method not in {"feedback.overview", "feedback.events"}:
-            raise PluginUiRpcInvalidRequest(f"未知 proactive_feedback 插件界面方法: {method}")
-        reader = ProactiveFeedbackDashboardReader(self._db_path.parent)
-        if method == "feedback.overview":
-            if payload:
-                raise PluginUiRpcInvalidRequest("feedback.overview 不接受参数")
-            return reader.get_overview()
-        if set(payload) - {"page", "page_size", "feedback_type"}:
-            raise PluginUiRpcInvalidRequest("feedback.events 参数无效")
-        page = _ui_page_value(payload, "page", default=1, maximum=10_000)
-        page_size = _ui_page_value(payload, "page_size", default=30, maximum=50)
-        feedback_type = _ui_feedback_type(payload)
-        items, total = reader.list_events(
-            page=page, page_size=page_size, feedback_type=feedback_type,
-        )
-        return {"items": items, "total": total, "page": page, "page_size": page_size}
-
 
 def _aggregate_user_rows(rows: list[MessageRow]) -> MessageRow:
     """保留同 Turn 多条输入的次序，并让最后输入拥有稳定反馈 identity。"""
@@ -352,21 +319,3 @@ def _bind_embeddings(embeddings: Embeddings, ctx: Context) -> EmbedBatch:
 async def _no_embed(texts: list[str]) -> list[list[float]]:
     _ = texts
     raise RuntimeError("显式引用反馈不得调用 embedding")
-
-
-def _ui_page_value(payload: dict[str, object], name: str, *,
-                       default: int, maximum: int) -> int:
-    value = payload.get(name, default)
-    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= maximum:
-        raise PluginUiRpcInvalidRequest(f"{name} 必须是 1 到 {maximum} 的整数")
-    return value
-
-
-def _ui_feedback_type(payload: dict[str, object]) -> str:
-    value = payload.get("feedback_type", "")
-    if not isinstance(value, str):
-        raise PluginUiRpcInvalidRequest("feedback_type 必须是字符串")
-    allowed = {"", "topic_follow", "explicit_quote", "no_topic_follow", "unscored"}
-    if value not in allowed:
-        raise PluginUiRpcInvalidRequest("feedback_type 不受支持")
-    return value

@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: kachofugetsu09/akashic-agent
-          ref: 1a5327e495153c2b42d501ba42b671fafb2267f4
+          ref: cbd7d3f775d2d4669e3d929272aea29ed4de1b0e
           path: .akashic-core
       - uses: actions/setup-python@v5
         with:
@@ -35,11 +35,6 @@ jobs:
           AKASHIC_AGENT_ROOT: .akashic-core
           PYTHONPATH: .akashic-core
         run: python -m pytest -q tests
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: Verify plugin UI
-        run: node --test tests/test_plugin_ui.mjs
       - name: Check v3 source types
         env:
           AKASHIC_AGENT_ROOT: .akashic-core

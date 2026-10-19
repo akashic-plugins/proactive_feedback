@@ -90,7 +90,7 @@ def test_module_uses_message_runtime_contract() -> None:
     manifest = load_static_plugin_manifest(Path(__file__).parents[1])
     loaded = ComposablePlugin.from_module(feedback, manifest)
     assert loaded.name == "proactive_feedback"
-    assert loaded.version == "4.0.3"
+    assert loaded.version == "4.0.4"
     assert inspect.signature(feedback.apply).parameters.keys() == {"ctx"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
@@ -332,7 +332,6 @@ async def apply(ctx):
     host = PluginManager([sources], workspace=workspace, installed_cache_root=tmp_path / 'cache')
     try:
         await host.load_all()
-        await host.start_runtime()
         root = host.live_root
         assert root is not None
         _append_turn(cast(MessageCatalog, root.context.require(MESSAGE_CATALOG))._log)
@@ -359,24 +358,12 @@ async def apply(ctx):
         await host.terminate_all()
         host = PluginManager([sources], workspace=tmp_path / 'workspace', installed_cache_root=tmp_path / 'cache')
         await host.load_all()
-        await host.start_runtime()
         await asyncio.sleep(0.05)
         assert len(feedback.SqliteFeedbackHistory(db_paths[0]).page(
             after_cursor=0, max_items=10,
         ).records) == 1
     finally:
         await host.terminate_all()
-        log.close()
-
-
-def test_plugin_ui_projection_rejects_unknown_method_without_writing(tmp_path: Path) -> None:
-    log = MessageLog(tmp_path / "sessions.db")
-    try:
-        runtime = _runtime(log, tmp_path / "missing" / "proactive_feedback.db")
-        with pytest.raises(feedback.PluginUiRpcInvalidRequest):
-            runtime.query_plugin_ui("feedback.delete", {}, session_id=None, turn_id=None)
-        assert not runtime._db_path.exists()
-    finally:
         log.close()
 
 
