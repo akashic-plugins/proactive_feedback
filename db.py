@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,6 +127,12 @@ def _initialize_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS proactive_feedback_session_catalog (
             session_key TEXT PRIMARY KEY,
             discovered_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS proactive_feedback_discovery_heads (
+            session_key TEXT PRIMARY KEY,
+            rule_version INTEGER NOT NULL,
+            head INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS proactive_feedback_outbox (
@@ -270,6 +277,40 @@ def insert_feedback_input(
         conn.commit()
         return row_id
     except (sqlite3.Error, RuntimeError, ValueError):
+        conn.rollback()
+        raise
+
+
+def read_discovery_heads(conn: sqlite3.Connection, *, rule_version: int) -> dict[str, int]:
+    """读取已完成发现的 Session head；规则版本不同的旧进度视为没有。"""
+
+    rows = conn.execute(
+        "SELECT session_key, head FROM proactive_feedback_discovery_heads WHERE rule_version = ?",
+        (rule_version,),
+    ).fetchall()
+    return {str(row["session_key"]): int(row["head"]) for row in rows}
+
+
+def save_discovery_heads(
+    conn: sqlite3.Connection, heads: Mapping[str, int], *, rule_version: int,
+) -> None:
+    """在 inbox 写入之后记录发现进度；进度只会落后于 inbox，不会超前。"""
+
+    if not heads:
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            """
+            INSERT INTO proactive_feedback_discovery_heads(session_key, rule_version, head)
+            VALUES (?, ?, ?)
+            ON CONFLICT(session_key) DO UPDATE SET
+                rule_version = excluded.rule_version, head = excluded.head
+            """,
+            [(session_key, rule_version, head) for session_key, head in heads.items()],
+        )
+        conn.commit()
+    except sqlite3.Error:
         conn.rollback()
         raise
 
