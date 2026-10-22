@@ -21,6 +21,7 @@ from plugins.turn_projection.contract import TURN_PROJECTION, TurnProjection
 from .db import (
     FeedbackEvent, FeedbackInputRecord, insert_feedback, insert_feedback_input,
     feedback_identity_exists, mark_feedback_input_processed, open_db, pending_feedback_inputs,
+    read_discovery_heads, save_discovery_heads,
 )
 from .history import PROACTIVE_FEEDBACK_HISTORY, SqliteFeedbackHistory
 from .scorer import (
@@ -32,11 +33,13 @@ logger = logging.getLogger("plugin.proactive_feedback")
 _FEEDBACK_DB_NAME = "proactive_feedback.db"
 _PREVIEW_MAX_CHARS = 2400
 _RETRY_SECONDS = 1.0
+# 发现规则（哪些 Turn 进入 inbox）变化时递增，旧进度随之作废并重新追赶。
+_DISCOVERY_RULE_VERSION = 1
 T = TypeVar("T")
 
 api_version = 3
 name = "proactive_feedback"
-version = "4.0.4"
+version = "4.0.5"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
 inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, EMBEDDINGS)
@@ -99,6 +102,10 @@ class ProactiveFeedbackRuntime:
 
     async def _follow_heads(self) -> None:
         """发现成功后推进 head；评分结果不改变发现进度。"""
+        # 开机从耐久进度续追，只读取上次之后变化的 Session，而不是重放全部历史。
+        self._heads = await self._store_io(
+            lambda sink: read_discovery_heads(sink, rule_version=_DISCOVERY_RULE_VERSION)
+        )
         async for heads in self._catalog.follow():
             while True:
                 try:
@@ -128,15 +135,25 @@ class ProactiveFeedbackRuntime:
         # 1. 保留空目录初始化；连接的完整寿命只在物理 worker 内。
         await self._store_io(lambda _sink: None)
         attributes = await run_file_io(self._catalog.snapshot_attributes)
-        for session_id, head in heads.items():
-            if self._heads.get(session_id) == head:
-                continue
-            session_attributes = attributes.get(session_id)
-            if session_attributes is None or session_attributes.visibility != "listed":
-                continue
-            reader = self._catalog.reader(session_id)
-            messages = await run_file_io(lambda: reader.snapshot(through_seq=head))
-            await self._discover_session(session_id, messages)
+        discovered: dict[str, int] = {}
+        try:
+            for session_id, head in heads.items():
+                if self._heads.get(session_id) == head:
+                    continue
+                session_attributes = attributes.get(session_id)
+                if session_attributes is None or session_attributes.visibility != "listed":
+                    continue
+                reader = self._catalog.reader(session_id)
+                messages = await run_file_io(lambda: reader.snapshot(through_seq=head))
+                await self._discover_session(session_id, messages)
+                discovered[session_id] = head
+        finally:
+            # 2. 已写完 inbox 的 Session 才记进度；中途失败或取消也保留已完成部分。
+            #    未列出的 Session 不记，之后改为列出时仍会被发现。
+            if discovered:
+                await self._store_io(lambda sink: save_discovery_heads(
+                    sink, discovered, rule_version=_DISCOVERY_RULE_VERSION,
+                ))
 
     async def _discover_session(self, session_id: str,
                                 messages: tuple[Message, ...]) -> None:

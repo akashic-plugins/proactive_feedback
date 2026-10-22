@@ -90,7 +90,7 @@ def test_module_uses_message_runtime_contract() -> None:
     manifest = load_static_plugin_manifest(Path(__file__).parents[1])
     loaded = ComposablePlugin.from_module(feedback, manifest)
     assert loaded.name == "proactive_feedback"
-    assert loaded.version == "4.0.4"
+    assert loaded.version == "4.0.5"
     assert inspect.signature(feedback.apply).parameters.keys() == {"ctx"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
@@ -229,7 +229,7 @@ async def test_scoring_failure_does_not_repeat_discovery_or_block_new_heads(
     async def record_discovery(session_id, messages):
         await discover(session_id, messages)
         discovered.append(session_id)
-        if session_id == "akashic:second":
+        if {"akashic:test", "akashic:second"} <= set(discovered):
             complete.set()
 
     async def fail_scoring():
@@ -246,7 +246,7 @@ async def test_scoring_failure_does_not_repeat_discovery_or_block_new_heads(
     try:
         async with asyncio.timeout(3):
             await complete.wait()
-        assert discovered == ["akashic:test", "akashic:second"]
+        assert sorted(discovered) == ["akashic:second", "akashic:test"]
         assert attempts >= 2
     finally:
         task.cancel()
