@@ -14,8 +14,10 @@ Akashic proactive feedback plugin.
   和 Session identity 写入 inbox，正文只在评分内存中从 Message 重建。
 - 发现续读点（`proactive_feedback_discovery_cursor`）按 Session 记录已扫描 head 与每个来源的
   闭合边界、未闭合尾段起点。head 前进时只解码新消息，以及有新消息的来源自己的未闭合尾段；
-  消息前缀被改写（Core `prefix_revision` 变化）、head 回退或 Core 不提供改写标记时从头发现，
-  inbox 写入幂等。首次升级每个 Session 全量发现一次。
+  head 变化时若消息前缀已被改写（Core `prefix_revision` 变化）、head 回退或 Core 不提供改写标记，
+  该 Session 从头发现，inbox 写入幂等；只改写旧消息而 head 不变时不触发（与原实现相同）。
+  首次升级每个 Session 全量发现一次。同一轮写入 inbox 的次序与全量重扫一致：按各来源首条 Input
+  的先后，续读点保存这一次序。
 - 候选只需要 Turn 首条输入之前的有界历史：普通追问读到上一个用户输入，引用回复读到最近
   256 条非空助手消息；评分按 inbox 身份读取本 Turn 成员，不再整段解码 Session。
 - 历史发现与 inbox 评分独立推进：评分失败不会重扫已发现的 Message 前缀，

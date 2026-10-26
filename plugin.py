@@ -77,7 +77,8 @@ async def apply(ctx: Context) -> None:
 
 @dataclass(frozen=True)
 class _PendingTurn:
-    """一个新闭合、待判定候选的 Turn：聚合用户行、首条输入 seq 与 inbox 身份。"""
+    """一个新闭合、待判定候选的 Turn：来源、聚合用户行、首条输入 seq 与 inbox 身份。"""
+    source: str
     user: MessageRow
     first_seq: int
     user_ids: tuple[str, ...]
@@ -180,9 +181,13 @@ class ProactiveFeedbackRuntime:
                     tuple, after_seq=read_from, through_seq=cursor.head, source=source,
                 )), *own)
             progress[source] = await self._closed_turns(own, source, boundary, head, pending)
+        # 2. 全量重扫按各来源首条 Input 的次序写 inbox，同一主动消息先到先得，次序必须保持。
+        order = _input_order(cursor.input_order, fresh)
+        rank = {source: index for index, source in enumerate(order)}
+        pending.sort(key=lambda turn: rank.get(turn.source, len(rank)))
         if not pending:
-            return DiscoveryCursor(cursor.prefix_revision, head, progress)
-        # 2. 候选只看各 Turn 首条输入之前；只有引用回复需要最近 256 条助手消息的窗口。
+            return DiscoveryCursor(cursor.prefix_revision, head, progress, order)
+        # 3. 候选只看各 Turn 首条输入之前；只有引用回复需要最近 256 条助手消息的窗口。
         first = min(turn.first_seq for turn in pending)
         depth = _LOOKBACK_ASSISTANTS if any(_needs_recent(turn.user) for turn in pending) else 0
         rows = await run_file_io(lambda: [
@@ -193,7 +198,7 @@ class ProactiveFeedbackRuntime:
         ])
         candidates = CandidateIndex(rows)
         for turn in pending:
-            # 3. 历史追赶必须让聊天、心跳和取消任务继续运行；每次只接纳一个 Turn。
+            # 4. 历史追赶必须让聊天、心跳和取消任务继续运行；每次只接纳一个 Turn。
             await asyncio.sleep(0)
             if self._candidates(candidates, turn.user, turn.first_seq):
                 await self._store_io(lambda sink: insert_feedback_input(
@@ -201,7 +206,7 @@ class ProactiveFeedbackRuntime:
                     client_message_id=turn.user_ids[0], user_message_id=turn.user_ids[-1],
                     user_message_ids=turn.user_ids, assistant_message_id=turn.ending_id,
                 ))
-        return DiscoveryCursor(cursor.prefix_revision, head, progress)
+        return DiscoveryCursor(cursor.prefix_revision, head, progress, order)
 
     async def _closed_turns(
         self, own: tuple[Message, ...], source: str, boundary: int, head: int,
@@ -220,7 +225,7 @@ class ProactiveFeedbackRuntime:
             if not users or not isinstance(by_id[turn.ending_message_id].body, Output):
                 continue
             pending.append(_PendingTurn(
-                _aggregate_user_rows(message_rows_from_messages(users)), users[0].seq,
+                source, _aggregate_user_rows(message_rows_from_messages(users)), users[0].seq,
                 tuple(message.message_id for message in users), turn.ending_message_id,
             ))
         closed = [turn.through_seq for turn in turns if turn.status != "open"]
@@ -329,6 +334,15 @@ class ProactiveFeedbackRuntime:
     async def _complete(self, row_id: int) -> None:
         """确认单条处理回执，取消后也等待真实提交与连接关闭。"""
         await self._store_io(lambda sink: mark_feedback_input_processed(sink, row_id=row_id))
+
+
+def _input_order(known: tuple[str, ...], fresh: tuple[Message, ...]) -> tuple[str, ...]:
+    """已登记来源之后按首条 Input 追加本批新来源；新来源的首条 Input 必晚于已登记来源。"""
+    first: dict[str, int] = {}
+    for message in fresh:
+        if isinstance(message.body, Input) and message.source not in known:
+            _ = first.setdefault(message.source, message.seq)
+    return known + tuple(sorted(first, key=first.__getitem__))
 
 
 def _needs_recent(user: MessageRow) -> bool:

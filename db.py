@@ -45,12 +45,14 @@ class DiscoveryCursor:
     ``sources`` maps a source to ``(boundary, read_from)``: the last closed Turn
     boundary that projection resumes from, and the seq after which that source
     still has unprocessed messages (just before its open tail's first member,
-    or the scanned head).
+    or the scanned head). ``input_order`` lists sources by their first Input,
+    the order a full rescan would visit them when writing inbox rows.
     """
 
     prefix_revision: int
     head: int
     sources: dict[str, tuple[int, int]]
+    input_order: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -305,11 +307,13 @@ def load_discovery_cursors(conn: sqlite3.Connection) -> dict[str, DiscoveryCurso
     ):
         try:
             raw = json.loads(row["sources_json"])
-            sources = {str(source): (int(pair[0]), int(pair[1])) for source, pair in raw.items()}
+            sources = {str(source): (int(pair[0]), int(pair[1]))
+                       for source, pair in raw["sources"].items()}
+            order = tuple(str(source) for source in raw["input_order"])
         except (TypeError, ValueError, KeyError, IndexError, AttributeError):
             continue
         cursors[str(row["session_key"])] = DiscoveryCursor(
-            int(row["prefix_revision"]), int(row["head"]), sources,
+            int(row["prefix_revision"]), int(row["head"]), sources, order,
         )
     return cursors
 
@@ -325,7 +329,8 @@ def save_discovery_cursor(conn: sqlite3.Connection, session_key: str, cursor: Di
             head = excluded.head, sources_json = excluded.sources_json
         """,
         (session_key, cursor.prefix_revision, cursor.head,
-         json.dumps({source: list(pair) for source, pair in cursor.sources.items()}, ensure_ascii=False)),
+         json.dumps({"sources": {source: list(pair) for source, pair in cursor.sources.items()},
+                     "input_order": list(cursor.input_order)}, ensure_ascii=False)),
     )
     conn.commit()
 
