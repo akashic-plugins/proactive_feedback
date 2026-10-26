@@ -39,6 +39,21 @@ class FeedbackOutboxRecord:
 
 
 @dataclass(frozen=True)
+class DiscoveryCursor:
+    """One Session's discovery progress over an unchanged Message prefix.
+
+    ``sources`` maps a source to ``(boundary, read_from)``: the last closed Turn
+    boundary that projection resumes from, and the seq after which that source
+    still has unprocessed messages (just before its open tail's first member,
+    or the scanned head).
+    """
+
+    prefix_revision: int
+    head: int
+    sources: dict[str, tuple[int, int]]
+
+
+@dataclass(frozen=True)
 class FeedbackInputRecord:
     """Describe one committed Turn identity waiting for durable processing."""
 
@@ -122,6 +137,13 @@ def _initialize_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_pfe_input_pending
         ON proactive_feedback_input_inbox(processed_at, id);
+
+        CREATE TABLE IF NOT EXISTS proactive_feedback_discovery_cursor (
+            session_key TEXT PRIMARY KEY,
+            prefix_revision INTEGER NOT NULL,
+            head INTEGER NOT NULL,
+            sources_json TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS proactive_feedback_session_catalog (
             session_key TEXT PRIMARY KEY,
@@ -272,6 +294,40 @@ def insert_feedback_input(
     except (sqlite3.Error, RuntimeError, ValueError):
         conn.rollback()
         raise
+
+
+def load_discovery_cursors(conn: sqlite3.Connection) -> dict[str, DiscoveryCursor]:
+    """Read every Session's saved discovery progress; malformed rows restart that Session."""
+
+    cursors: dict[str, DiscoveryCursor] = {}
+    for row in conn.execute(
+        "SELECT session_key, prefix_revision, head, sources_json FROM proactive_feedback_discovery_cursor"
+    ):
+        try:
+            raw = json.loads(row["sources_json"])
+            sources = {str(source): (int(pair[0]), int(pair[1])) for source, pair in raw.items()}
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError):
+            continue
+        cursors[str(row["session_key"])] = DiscoveryCursor(
+            int(row["prefix_revision"]), int(row["head"]), sources,
+        )
+    return cursors
+
+
+def save_discovery_cursor(conn: sqlite3.Connection, session_key: str, cursor: DiscoveryCursor) -> None:
+    """Replace one Session's discovery progress after its Turn inputs are committed."""
+
+    _ = conn.execute(
+        """
+        INSERT INTO proactive_feedback_discovery_cursor(session_key, prefix_revision, head, sources_json)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_key) DO UPDATE SET prefix_revision = excluded.prefix_revision,
+            head = excluded.head, sources_json = excluded.sources_json
+        """,
+        (session_key, cursor.prefix_revision, cursor.head,
+         json.dumps({source: list(pair) for source, pair in cursor.sources.items()}, ensure_ascii=False)),
+    )
+    conn.commit()
 
 
 def pending_feedback_inputs(
