@@ -90,7 +90,7 @@ def test_module_uses_message_runtime_contract() -> None:
     manifest = load_static_plugin_manifest(Path(__file__).parents[1])
     loaded = ComposablePlugin.from_module(feedback, manifest)
     assert loaded.name == "proactive_feedback"
-    assert loaded.version == "4.0.4"
+    assert loaded.version == "4.1.0"
     assert inspect.signature(feedback.apply).parameters.keys() == {"ctx"}
     source = (Path(__file__).parents[1] / "plugin.py").read_text(encoding="utf-8")
     for removed in (
@@ -226,11 +226,12 @@ async def test_scoring_failure_does_not_repeat_discovery_or_block_new_heads(
     discover = runtime._discover_session
     attempts = 0
 
-    async def record_discovery(session_id, messages):
-        await discover(session_id, messages)
+    async def record_discovery(session_id, head, cursor):
+        progress = await discover(session_id, head, cursor)
         discovered.append(session_id)
         if session_id == "akashic:second":
             complete.set()
+        return progress
 
     async def fail_scoring():
         nonlocal attempts

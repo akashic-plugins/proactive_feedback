@@ -6,6 +6,7 @@ import sqlite3
 from importlib import import_module
 from collections.abc import Callable, Mapping
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -16,11 +17,12 @@ from plugins.ui.contract import UI
 from plugins.ledger.contract import Input, Message, Output
 from core.common.file_io import run_file_io
 
-from plugins.ledger.contract import MessageCatalog
+from plugins.ledger.contract import MessageCatalog, MessageReader
 from plugins.turn_projection.contract import TURN_PROJECTION, TurnProjection
 from .db import (
-    FeedbackEvent, FeedbackInputRecord, insert_feedback, insert_feedback_input,
-    feedback_identity_exists, mark_feedback_input_processed, open_db, pending_feedback_inputs,
+    DiscoveryCursor, FeedbackEvent, FeedbackInputRecord, insert_feedback, insert_feedback_input,
+    feedback_identity_exists, load_discovery_cursors, mark_feedback_input_processed, open_db,
+    pending_feedback_inputs, save_discovery_cursor,
 )
 from .history import PROACTIVE_FEEDBACK_HISTORY, SqliteFeedbackHistory
 from .scorer import (
@@ -32,11 +34,14 @@ logger = logging.getLogger("plugin.proactive_feedback")
 _FEEDBACK_DB_NAME = "proactive_feedback.db"
 _PREVIEW_MAX_CHARS = 2400
 _RETRY_SECONDS = 1.0
+# 候选只看最近 64×4 条非空助手消息与上一个用户输入之后的主动输出；回看读到两者都覆盖为止。
+_LOOKBACK_ASSISTANTS = 256
+_LOOKBACK_PAGE = 200
 T = TypeVar("T")
 
 api_version = 3
 name = "proactive_feedback"
-version = "4.0.4"
+version = "4.1.0"
 desc = "从 Message 日志记录主动消息被继续的反馈，并提供只读历史与面板。"
 author = "Akashic"
 inject = (MESSAGE_CATALOG, TURN_PROJECTION, UI, EMBEDDINGS)
@@ -70,8 +75,18 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.on(RUNTIME_STOPPING, stop)
 
 
+@dataclass(frozen=True)
+class _PendingTurn:
+    """一个新闭合、待判定候选的 Turn：来源、聚合用户行、首条输入 seq 与 inbox 身份。"""
+    source: str
+    user: MessageRow
+    first_seq: int
+    user_ids: tuple[str, ...]
+    ending_id: str
+
+
 class ProactiveFeedbackRuntime:
-    """从完整 Message 前缀发现已完成回复，并拥有评分 inbox 与不可变历史。"""
+    """按发现续读点增量发现已完成回复，并拥有评分 inbox 与不可变历史。"""
     def __init__(self, *, catalog: MessageCatalog, projection: TurnProjection,
                  embed_batch: EmbedBatch, db_path: Path) -> None:
         self._catalog = catalog
@@ -79,6 +94,7 @@ class ProactiveFeedbackRuntime:
         self._embed_batch = embed_batch
         self._db_path = db_path
         self._heads: dict[str, int] = {}
+        self._cursors: dict[str, DiscoveryCursor] | None = None
         self._store_lock = asyncio.Lock()
 
     async def _store_io(self, operation: Callable[[sqlite3.Connection], T]) -> T:
@@ -124,68 +140,105 @@ class ProactiveFeedbackRuntime:
             await asyncio.sleep(_RETRY_SECONDS)
 
     async def _discover_changed(self, heads: Mapping[str, int]) -> None:
-        """只按 Core 目录选择列出的 Session；每个完整前缀可安全重复投影。"""
+        """只按 Core 目录选择列出的 Session；从保存的闭合边界续读，不整段解码历史。"""
         # 1. 保留空目录初始化；连接的完整寿命只在物理 worker 内。
         await self._store_io(lambda _sink: None)
+        if self._cursors is None:
+            self._cursors = await self._store_io(load_discovery_cursors)
         attributes = await run_file_io(self._catalog.snapshot_attributes)
+        revision = await run_file_io(self._catalog.prefix_revision)
         for session_id, head in heads.items():
             if self._heads.get(session_id) == head:
                 continue
             session_attributes = attributes.get(session_id)
             if session_attributes is None or session_attributes.visibility != "listed":
                 continue
-            reader = self._catalog.reader(session_id)
-            messages = await run_file_io(lambda: reader.snapshot(through_seq=head))
-            await self._discover_session(session_id, messages)
+            # 2. 前缀被改写、Core 无改写标记或 head 回退时从头发现；inbox 写入幂等。
+            saved = self._cursors.get(session_id)
+            if saved is None or revision is None or saved.prefix_revision != revision or saved.head > head:
+                saved = DiscoveryCursor(-1 if revision is None else revision, -1, {})
+            elif saved.head == head:
+                continue
+            cursor = await self._discover_session(session_id, head, saved)
+            # 3. 本轮 Turn 身份都已提交才保存续读点；中途取消从旧续读点重做。
+            if revision is not None:
+                await self._store_io(lambda sink: save_discovery_cursor(sink, session_id, cursor))
+                self._cursors[session_id] = cursor
 
-    async def _discover_session(self, session_id: str,
-                                messages: tuple[Message, ...]) -> None:
-        """把含用户输入与最终输出的完整 Turn 身份写入插件 inbox。"""
-        # 1. 每个前缀只建一次候选索引，避免每个 Turn 重新扫描历史。
-        rows = await run_file_io(lambda: message_rows_from_messages(messages))
+    async def _discover_session(self, session_id: str, head: int,
+                                cursor: DiscoveryCursor) -> DiscoveryCursor:
+        """把新闭合、含用户输入与最终输出的 Turn 身份写入插件 inbox，返回新的续读点。"""
+        # 1. 只有出现新消息的来源可能闭合新 Turn；各来源只读自己尚未处理的尾段。
+        reader = self._catalog.reader(session_id)
+        fresh = await run_file_io(lambda: reader.snapshot(after_seq=cursor.head, through_seq=head))
+        progress = dict(cursor.sources)
+        pending: list[_PendingTurn] = []
+        for source in dict.fromkeys(message.source for message in fresh):
+            boundary, read_from = cursor.sources.get(source, (-1, cursor.head))
+            own = tuple(message for message in fresh if message.source == source)
+            if read_from < cursor.head:
+                own = (*await run_file_io(lambda: reader.scan(
+                    tuple, after_seq=read_from, through_seq=cursor.head, source=source,
+                )), *own)
+            progress[source] = await self._closed_turns(own, source, boundary, head, pending)
+        # 2. 全量重扫按各来源首条 Input 的次序写 inbox，同一主动消息先到先得，次序必须保持。
+        order = _input_order(cursor.input_order, fresh)
+        rank = {source: index for index, source in enumerate(order)}
+        pending.sort(key=lambda turn: rank.get(turn.source, len(rank)))
+        if not pending:
+            return DiscoveryCursor(cursor.prefix_revision, head, progress, order)
+        # 3. 候选只看各 Turn 首条输入之前；只有引用回复需要最近 256 条助手消息的窗口。
+        first = min(turn.first_seq for turn in pending)
+        depth = _LOOKBACK_ASSISTANTS if any(_needs_recent(turn.user) for turn in pending) else 0
+        rows = await run_file_io(lambda: [
+            *_lookback_rows(reader, before_seq=first, through_seq=head, assistants=depth),
+            *message_rows_from_messages(reader.snapshot(
+                after_seq=first - 1, through_seq=max(turn.first_seq for turn in pending) - 1,
+            )),
+        ])
         candidates = CandidateIndex(rows)
-        by_id = {message.message_id: message for message in messages}
-        row_by_id = {row.id: row for row in rows}
-        sources = tuple(dict.fromkeys(
-            message.source for message in messages if isinstance(message.body, Input)
-        ))
-        for source in sources:
-            turns = await run_file_io(lambda: self._projection.project(messages, source))
-            for turn in turns:
-                # 2. 历史追赶必须让聊天、心跳和取消任务继续运行。
-                await asyncio.sleep(0)
-                if turn.status != "complete" or turn.ending_message_id is None:
-                    continue
-                members = [by_id[message_id] for message_id in turn.message_ids]
-                users = [message for message in members if isinstance(message.body, Input)]
-                assistant = by_id[turn.ending_message_id]
-                if not users or not isinstance(assistant.body, Output):
-                    continue
-                aggregate = _aggregate_user_rows(
-                    [row_by_id[message.message_id] for message in users]
-                )
-                if not self._candidates(candidates, aggregate, users[0].seq):
-                    continue
-                # 3. 每次只接纳一个 Turn，取消先等本次提交，后续 Turn 不再开始。
-                ending_id = turn.ending_message_id
-                user_ids = tuple(message.message_id for message in users)
-                def write_input(sink: sqlite3.Connection) -> None:
-                    insert_feedback_input(
-                        sink, session_key=session_id,
-                        turn_id=ending_id,
-                        client_message_id=user_ids[0],
-                        user_message_id=user_ids[-1],
-                        user_message_ids=user_ids,
-                        assistant_message_id=ending_id,
-                    )
+        for turn in pending:
+            # 4. 历史追赶必须让聊天、心跳和取消任务继续运行；每次只接纳一个 Turn。
+            await asyncio.sleep(0)
+            if self._candidates(candidates, turn.user, turn.first_seq):
+                await self._store_io(lambda sink: insert_feedback_input(
+                    sink, session_key=session_id, turn_id=turn.ending_id,
+                    client_message_id=turn.user_ids[0], user_message_id=turn.user_ids[-1],
+                    user_message_ids=turn.user_ids, assistant_message_id=turn.ending_id,
+                ))
+        return DiscoveryCursor(cursor.prefix_revision, head, progress, order)
 
-                await self._store_io(write_input)
+    async def _closed_turns(
+        self, own: tuple[Message, ...], source: str, boundary: int, head: int,
+        pending: list[_PendingTurn],
+    ) -> tuple[int, int]:
+        """从闭合边界投影一个来源，收集待判定 Turn，返回它的新续读点。"""
+        turns = await run_file_io(
+            lambda: self._projection.project(own, source, after_seq=boundary)
+        )
+        by_id = {message.message_id: message for message in own}
+        for turn in turns:
+            if turn.status != "complete" or turn.ending_message_id is None:
+                continue
+            users = [by_id[message_id] for message_id in turn.message_ids
+                     if isinstance(by_id[message_id].body, Input)]
+            if not users or not isinstance(by_id[turn.ending_message_id].body, Output):
+                continue
+            pending.append(_PendingTurn(
+                source, _aggregate_user_rows(message_rows_from_messages(users)), users[0].seq,
+                tuple(message.message_id for message in users), turn.ending_message_id,
+            ))
+        closed = [turn.through_seq for turn in turns if turn.status != "open"]
+        ending = closed[-1] if closed else boundary
+        # 长期不闭合的尾段从其首个成员续读，不把读取起点拖回闭合边界。
+        if turns and turns[-1].status == "open":
+            return ending, by_id[turns[-1].message_ids[0]].seq - 1
+        return ending, head
 
     @staticmethod
     def _candidates(index: CandidateIndex, user: MessageRow,
                     before_seq: int) -> list[MessageRow]:
-        quote = parse_quote_parts(user.content)
-        if user.reply_to_id is not None or quote.quoted_text:
+        if _needs_recent(user):
             return index.recent(before_seq=before_seq, limit=64)
         return index.since_previous_user(before_seq=before_seq, limit=8)
 
@@ -211,25 +264,20 @@ class ProactiveFeedbackRuntime:
         if await self._store_io(recover_accepted):
             return True
 
-        # 2. 完整历史解码在工作线程完成，不能拖住聊天和 Host Bridge 心跳。
-        messages = await run_file_io(self._catalog.reader(record.session_key).snapshot)
-        rows = await run_file_io(lambda: message_rows_from_messages(messages))
-        by_id = {row.id: row for row in rows}
-        try:
-            user_rows = [by_id[message_id] for message_id in record.user_message_ids]
-            if record.assistant_message_id is None:
-                raise KeyError("assistant_message_id")
-            assistant = by_id[record.assistant_message_id]
-        except KeyError:
+        # 2. 按身份读取本 Turn 成员，候选只需有界回看；读取在工作线程完成，不拖住聊天与心跳。
+        reader = self._catalog.reader(record.session_key)
+        loaded = await run_file_io(lambda: _record_rows(reader, record))
+        if loaded is None:
             logger.warning(
                 "proactive_feedback inbox 引用的 Message 暂不可读 session=%s user=%s",
                 record.session_key, record.user_message_id,
             )
             return False
+        user_rows, assistant, history = loaded
         if any(row.role != "user" for row in user_rows) or assistant.role != "assistant":
             raise ValueError("proactive_feedback inbox Message 类型与原身份不一致")
         user = _aggregate_user_rows(user_rows)
-        candidates = self._candidates(CandidateIndex(rows), user, user_rows[0].seq)
+        candidates = self._candidates(CandidateIndex(history), user, user_rows[0].seq)
         if not candidates:
             await self._complete(record.row_id)
             return True
@@ -286,6 +334,62 @@ class ProactiveFeedbackRuntime:
     async def _complete(self, row_id: int) -> None:
         """确认单条处理回执，取消后也等待真实提交与连接关闭。"""
         await self._store_io(lambda sink: mark_feedback_input_processed(sink, row_id=row_id))
+
+
+def _input_order(known: tuple[str, ...], fresh: tuple[Message, ...]) -> tuple[str, ...]:
+    """已登记来源之后按首条 Input 追加本批新来源；新来源的首条 Input 必晚于已登记来源。"""
+    first: dict[str, int] = {}
+    for message in fresh:
+        if isinstance(message.body, Input) and message.source not in known:
+            _ = first.setdefault(message.source, message.seq)
+    return known + tuple(sorted(first, key=first.__getitem__))
+
+
+def _needs_recent(user: MessageRow) -> bool:
+    """引用回复从最近的主动输出里找被引用者；普通追问只看上一个用户输入之后。"""
+    return user.reply_to_id is not None or bool(parse_quote_parts(user.content).quoted_text)
+
+
+def _lookback_rows(reader: MessageReader, *, before_seq: int,
+                   through_seq: int | None, assistants: int) -> list[MessageRow]:
+    """读 before_seq 之前的最短历史：含一条用户输入与 assistants 条非空助手消息，或已到会话开头。"""
+    pages: list[list[MessageRow]] = []
+    seen = 0
+    user = False
+    cursor = before_seq
+    while cursor > 0:
+        page = reader.read_tail(before_seq=cursor, through_seq=through_seq, limit=_LOOKBACK_PAGE)
+        if not page.messages:
+            break
+        rows = message_rows_from_messages(page.messages)
+        pages.append(rows)
+        seen += sum(1 for row in rows if row.role == "assistant" and row.content)
+        user = user or any(row.role == "user" for row in rows)
+        if not page.has_more or (seen >= assistants and user):
+            break
+        cursor = page.messages[0].seq
+    return [row for rows in reversed(pages) for row in rows]
+
+
+def _record_rows(reader: MessageReader, record: FeedbackInputRecord,
+                 ) -> tuple[list[MessageRow], MessageRow, list[MessageRow]] | None:
+    """inbox 身份对应的用户行、助手行与候选回看；任一成员暂不可读返回 None。"""
+    if record.assistant_message_id is None:
+        return None
+    found = [reader.get(message_id)
+             for message_id in (*record.user_message_ids, record.assistant_message_id)]
+    members = [message for message in found if message is not None]
+    if len(members) != len(found):
+        return None
+    rows = message_rows_from_messages(members)
+    try:
+        recent = _needs_recent(_aggregate_user_rows(rows[:-1]))
+    except ValueError:
+        # 聚合失败由调用方按原身份报错；回看按最宽窗口读取。
+        recent = True
+    history = _lookback_rows(reader, before_seq=rows[0].seq, through_seq=None,
+                             assistants=_LOOKBACK_ASSISTANTS if recent else 0)
+    return rows[:-1], rows[-1], history
 
 
 def _aggregate_user_rows(rows: list[MessageRow]) -> MessageRow:
