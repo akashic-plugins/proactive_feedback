@@ -15,6 +15,7 @@ from plugins.models.contract import EMBEDDINGS, Embeddings
 from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.ui.contract import UI
 from plugins.ledger.contract import Input, Message, Output
+from plugins.ledger.provenance import is_human_input
 from core.common.file_io import run_file_io
 
 from plugins.ledger.contract import MessageCatalog, MessageReader
@@ -221,7 +222,7 @@ class ProactiveFeedbackRuntime:
             if turn.status != "complete" or turn.ending_message_id is None:
                 continue
             users = [by_id[message_id] for message_id in turn.message_ids
-                     if isinstance(by_id[message_id].body, Input)]
+                     if is_human_input(by_id[message_id])]
             if not users or not isinstance(by_id[turn.ending_message_id].body, Output):
                 continue
             pending.append(_PendingTurn(
