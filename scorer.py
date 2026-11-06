@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from plugins.ledger.contract import ContentPart, Input, Message, Output
+from plugins.ledger.contract import DIALOGUE_SOURCES, Actor, origin
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,9 @@ def parse_quote_parts(content: str) -> QuoteParts:
 
 def _message_row(message: Message) -> MessageRow:
     body = message.body
-    role = "user" if isinstance(body, Input) else "assistant" if isinstance(body, Output) else "other"
+    # 出处统一读 Core 判定：只有人的输入算用户回应，插件自动输入不冒充用户。
+    actor = origin(message).actor
+    role = "user" if actor is Actor.USER and isinstance(body, Input) else "assistant" if isinstance(body, Output) else "other"
     parts = body.parts if isinstance(body, (Input, Output)) else ()
     content = "\n\n".join(
         part.value for part in parts
@@ -124,7 +127,7 @@ def _is_proactive_message(message: Message, parts: Sequence[object]) -> bool:
             decoded = json.loads(raw)
             if isinstance(decoded, dict) and decoded.get("proactive") is True:
                 return True
-    return message.source not in {"conversation", "legacy-unattributed"}
+    return message.source not in DIALOGUE_SOURCES
 
 
 def cosine(a: list[float], b: list[float]) -> float:
