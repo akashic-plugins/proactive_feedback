@@ -85,7 +85,7 @@ def _message_row(message: Message) -> MessageRow:
     body = message.body
     # 出处统一读 Core 判定：只有人的输入算用户回应，插件自动输入不冒充用户。
     actor = origin(message).actor
-    role = "user" if actor is Actor.HUMAN and isinstance(body, Input) else "assistant" if isinstance(body, Output) else "other"
+    role = "user" if actor is Actor.USER and isinstance(body, Input) else "assistant" if isinstance(body, Output) else "other"
     parts = body.parts if isinstance(body, (Input, Output)) else ()
     content = "\n\n".join(
         part.value for part in parts
