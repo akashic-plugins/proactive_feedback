@@ -15,7 +15,7 @@ from plugins.models.contract import EMBEDDINGS, Embeddings
 from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.ui.contract import UI
 from plugins.ledger.contract import Input, Message, Output
-from plugins.ledger.provenance import is_human_input
+from plugins.ledger.contract import is_human_input
 from core.common.file_io import run_file_io
 
 from plugins.ledger.contract import MessageCatalog, MessageReader

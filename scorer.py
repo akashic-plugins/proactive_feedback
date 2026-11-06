@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from plugins.ledger.contract import ContentPart, Input, Message, Output
-from plugins.ledger.provenance import DIALOGUE_SOURCES, Actor, origin
+from plugins.ledger.contract import DIALOGUE_SOURCES, Actor, origin
 
 
 @dataclass(frozen=True)
